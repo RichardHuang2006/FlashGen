@@ -1,0 +1,10 @@
+^C:\USERS\HUANG\DOWNLOADS\PROJECTS\CS\FLASHGEN\BUILD\CMAKEFILES\CCE6D13AA952BAF36068F3AA0E632617\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/huang/Downloads/Projects/CS/FlashGen -BC:/Users/huang/Downloads/Projects/CS/FlashGen/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/huang/Downloads/Projects/CS/FlashGen/build/FlashGen.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
