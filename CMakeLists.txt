@@ -1,132 +1,123 @@
 cmake_minimum_required(VERSION 3.20)
 project(FlashGen LANGUAGES CXX CUDA)
 
-# -- C++ / CUDA standards ----------------------------------------------------
+# ── C++ / CUDA standards ────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# -- GPU architecture ---------------------------------------------------------
-# Default sm_120 (Blackwell: RTX 50xx). Override via -DCUDA_ARCH=XX.
-# Common values: 75 (Turing RTX 20xx), 80 (A100), 86 (RTX 30xx),
-#                89 (RTX 40xx / Ada), 120 (RTX 50xx / Blackwell)
-set(CUDA_ARCH "120" CACHE STRING "CUDA compute capability (e.g. 75, 80, 86, 89, 120)")
-set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
+# ── GPU architecture ────────────────────────────────────────────────────
+# Default to sm_80 (Ampere). Override with -DGPU_ARCH=75|86|89|90|120 etc.
+set(GPU_ARCH "80" CACHE STRING "CUDA compute capability (e.g. 75, 80, 86, 89, 90)")
+set(CMAKE_CUDA_ARCHITECTURES ${GPU_ARCH})
+message(STATUS "Building for GPU architecture: sm_${GPU_ARCH}")
 
-# -- Optional FP16 mode -------------------------------------------------------
-option(USE_FP16 "Enable FP16 I/O (requires sm_70+)" OFF)
+# ── Build type ──────────────────────────────────────────────────────────
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# -- Find dependencies --------------------------------------------------------
+# ── Compiler flags ──────────────────────────────────────────────────────
+if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /O2")
+else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
+endif()
+
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG --use_fast_math")
+set(CMAKE_CUDA_FLAGS_DEBUG "-O0 -g -G -DDEBUG")
+
+# Enable separable compilation for CUDA
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
+# ── Optional FP16 mode ──────────────────────────────────────────────────
+option(FLASHGEN_FP16 "Enable FP16 precision" OFF)
+if(FLASHGEN_FP16)
+    add_compile_definitions(FLASHGEN_FP16=1)
+    message(STATUS "FP16 mode: ON")
+endif()
+
+# ── Dependencies ────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
-# -- Compiler flags (MSVC vs GCC/Clang) ----------------------------------------
-if(MSVC)
-    # MSVC host compiler flags
-    set(COMMON_CXX_FLAGS /O2 /W3 /EHsc /wd4505)
-    # Flags passed to MSVC as the CUDA host compiler
-    set(COMMON_CUDA_FLAGS
-        --use_fast_math
-        -Xcompiler=/O2
-        -Xcompiler=/W3
-        -Xcompiler=/EHsc
-        --expt-relaxed-constexpr
-        --expt-extended-lambda
-        -lineinfo
-    )
-else()
-    # GCC / Clang flags (Linux, MSYS2, MinGW)
-    set(COMMON_CXX_FLAGS -O3 -Wall -Wextra)
-    set(COMMON_CUDA_FLAGS
-        --use_fast_math
-        -Xcompiler=-O3
-        -Xcompiler=-Wall
-        --expt-relaxed-constexpr
-        --expt-extended-lambda
-        -lineinfo
-    )
-endif()
+# ── Include directories ─────────────────────────────────────────────────
+include_directories(${CMAKE_SOURCE_DIR}/include)
 
-if(USE_FP16)
-    list(APPEND COMMON_CUDA_FLAGS -DUSE_FP16)
-    if(MSVC)
-        list(APPEND COMMON_CXX_FLAGS /DUSE_FP16)
-    else()
-        list(APPEND COMMON_CXX_FLAGS -DUSE_FP16)
-    endif()
-endif()
-
-# -- Source files -------------------------------------------------------------
-set(FLASHGEN_CUDA_SOURCES
+# ── Source files ────────────────────────────────────────────────────────
+set(LIB_SOURCES
+    src/block_allocator.cpp
+    src/prefix_cache.cpp
+    src/scheduler.cpp
+    src/paged_kv_cache.cu
+    src/quantization.cu
     src/flash_attention.cu
     src/kernels.cu
     src/transformer.cu
-)
-set(FLASHGEN_CXX_SOURCES
     src/pipeline.cpp
 )
 
-# -- Static library -----------------------------------------------------------
-add_library(flashgen_lib STATIC
-    ${FLASHGEN_CUDA_SOURCES}
-    ${FLASHGEN_CXX_SOURCES}
-)
-target_include_directories(flashgen_lib PUBLIC include)
-target_compile_options(flashgen_lib PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:${COMMON_CXX_FLAGS}>
-    $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_CUDA_FLAGS}>
-)
+# ── Library target ──────────────────────────────────────────────────────
+add_library(flashgen_lib STATIC ${LIB_SOURCES})
 target_link_libraries(flashgen_lib PUBLIC
     CUDA::cudart
     CUDA::cublas
     CUDA::curand
 )
-# pthread is POSIX-only; std::thread uses native Win32 threads on Windows
 if(UNIX)
     target_link_libraries(flashgen_lib PUBLIC pthread)
 endif()
-set_target_properties(flashgen_lib PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
 
-# -- Main executable ----------------------------------------------------------
+# ── Main executable ─────────────────────────────────────────────────────
 add_executable(flashgen src/main.cpp)
-target_include_directories(flashgen PRIVATE include)
-target_compile_options(flashgen PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:${COMMON_CXX_FLAGS}>
-)
 target_link_libraries(flashgen PRIVATE flashgen_lib)
-if(UNIX)
-    target_link_libraries(flashgen PRIVATE pthread)
-endif()
 
-# -- Tests --------------------------------------------------------------------
+# ── Tests ───────────────────────────────────────────────────────────────
 enable_testing()
 
-function(add_flashgen_test name source)
-    if(source MATCHES "\\.cu$")
-        set_source_files_properties(${source} PROPERTIES LANGUAGE CUDA)
-    endif()
-    add_executable(${name} ${source})
-    target_include_directories(${name} PRIVATE include)
-    target_compile_options(${name} PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:${COMMON_CXX_FLAGS}>
-        $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_CUDA_FLAGS}>
-    )
-    target_link_libraries(${name} PRIVATE flashgen_lib)
-    if(UNIX)
-        target_link_libraries(${name} PRIVATE pthread)
-    endif()
-    add_test(NAME ${name} COMMAND ${name})
-endfunction()
+# Block allocator tests (C++ only, links CUDA for alloc)
+add_executable(test_block_allocator tests/test_block_allocator.cpp)
+target_link_libraries(test_block_allocator PRIVATE flashgen_lib)
+add_test(NAME BlockAllocator COMMAND test_block_allocator)
 
-add_flashgen_test(test_flash_attention tests/test_flash_attention.cu)
-add_flashgen_test(test_kernels         tests/test_kernels.cu)
-add_flashgen_test(test_pipeline        tests/test_pipeline.cpp)
+# Paged attention tests (CUDA)
+add_executable(test_paged_attention tests/test_paged_attention.cu)
+target_link_libraries(test_paged_attention PRIVATE flashgen_lib)
+add_test(NAME PagedAttention COMMAND test_paged_attention)
 
-# -- Summary ------------------------------------------------------------------
+# Prefix cache tests
+add_executable(test_prefix_cache tests/test_prefix_cache.cpp)
+target_link_libraries(test_prefix_cache PRIVATE flashgen_lib)
+add_test(NAME PrefixCache COMMAND test_prefix_cache)
+
+# Scheduler tests
+add_executable(test_scheduler tests/test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE flashgen_lib)
+add_test(NAME Scheduler COMMAND test_scheduler)
+
+# FlashAttention tests (CUDA)
+add_executable(test_flash_attention tests/test_flash_attention.cu)
+target_link_libraries(test_flash_attention PRIVATE flashgen_lib)
+add_test(NAME FlashAttention COMMAND test_flash_attention)
+
+# Kernel tests (CUDA)
+add_executable(test_kernels tests/test_kernels.cu)
+target_link_libraries(test_kernels PRIVATE flashgen_lib)
+add_test(NAME Kernels COMMAND test_kernels)
+
+# Pipeline / engine tests
+add_executable(test_pipeline tests/test_pipeline.cpp)
+target_link_libraries(test_pipeline PRIVATE flashgen_lib)
+add_test(NAME Pipeline COMMAND test_pipeline)
+
+# ── Summary ─────────────────────────────────────────────────────────────
+message(STATUS "")
 message(STATUS "FlashGen build configuration:")
-message(STATUS "  CUDA arch  : sm_${CUDA_ARCH}")
-message(STATUS "  Compiler   : ${CMAKE_CXX_COMPILER_ID}")
-message(STATUS "  FP16 mode  : ${USE_FP16}")
-message(STATUS "  Build type : ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Build type:    ${CMAKE_BUILD_TYPE}")
+message(STATUS "  GPU arch:      sm_${GPU_ARCH}")
+message(STATUS "  FP16:          ${FLASHGEN_FP16}")
+message(STATUS "  CUDA toolkit:  ${CUDAToolkit_VERSION}")
+message(STATUS "")

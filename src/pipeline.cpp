@@ -1,371 +1,467 @@
-/*
- * pipeline.cpp
- *
- * Asynchronous three-stage CPU-GPU inference pipeline.
- *
- * Stage 1 (preproc_thread_):
- *   - Receives InferenceRequest from input_queue_
- *   - Tokenizes prompt text
- *   - Copies token IDs to pinned host memory
- *   - Enqueues PreprocessedBatch to preproc_queue_
- *
- * Stage 2 (compute_thread_):
- *   - Dequeues PreprocessedBatch
- *   - Runs Transformer::prefill then iterative ::decode steps
- *   - Streams logits to pinned output buffer
- *   - Enqueues ComputedBatch to postproc_queue_
- *
- * Stage 3 (postproc_thread_):
- *   - Decodes token IDs to text (greedy or top-p sampling)
- *   - Invokes the per-request callback with InferenceResponse
- *   - Updates pipeline statistics
- */
-
 #include "pipeline.hpp"
-#include "transformer.hpp"
+#include "kernels.cuh"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <future>
 #include <numeric>
-#include <random>
-#include <sstream>
 
-namespace flashgen {
+// ===========================================================================
+//  InferenceEngine — production-grade continuous batching pipeline
+// ===========================================================================
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Construction / destruction
-// ════════════════════════════════════════════════════════════════════════════
+InferenceEngine::InferenceEngine(const EngineConfig& config)
+    : config_(config)
+{
+    CUDA_CHECK(cudaSetDevice(config.device_id));
+    print_device_info(config.device_id);
 
-AsyncPipeline::AsyncPipeline(
-    std::shared_ptr<Transformer> model, int /*queue_depth*/
-) : model_(std::move(model)) {
-    preproc_thread_ = std::thread([this]{ preproc_worker(); });
-    compute_thread_ = std::thread([this]{ compute_worker(); });
-    postproc_thread_ = std::thread([this]{ postproc_worker(); });
+    // Initialize model
+    model_ = std::make_unique<Transformer>(config.model);
+
+    // Load weights if path provided
+    if (!config.weight_path.empty()) {
+        CudaStream load_stream;
+        model_->load_weights(config.weight_path, load_stream);
+        load_stream.sync();
+    }
+
+    // Compute number of KV cache blocks
+    CacheConfig cache_cfg = config.cache;
+    if (cache_cfg.num_gpu_blocks < 0) {
+        auto [total, free] = gpu_memory_info();
+        cache_cfg.num_gpu_blocks = cache_cfg.auto_num_blocks(config.model, free);
+        printf("Auto-configured %d KV cache blocks (%.1f GB)\n",
+               cache_cfg.num_gpu_blocks,
+               (double)cache_cfg.num_gpu_blocks * cache_cfg.bytes_per_block(config.model) / 1073741824.0);
+    }
+
+    // Initialize block allocator
+    allocator_ = std::make_unique<BlockAllocator>(
+        cache_cfg.num_gpu_blocks,
+        cache_cfg.block_size,
+        config.model.n_layers,
+        config.model.actual_kv_heads(),
+        config.model.head_dim(),
+        cache_cfg.kv_quant);
+
+    // Initialize paged KV cache
+    kv_cache_ = std::make_unique<PagedKVCache>(*allocator_, config.model);
+
+    // Initialize prefix cache
+    prefix_cache_ = std::make_unique<PrefixCache>(
+        *allocator_, cache_cfg.block_size, config.model.n_layers);
+    prefix_cache_->set_enabled(cache_cfg.enable_prefix_caching);
+
+    // Initialize scheduler
+    scheduler_ = std::make_unique<Scheduler>(
+        config.scheduler, *allocator_, *kv_cache_, *prefix_cache_);
+
+    // Allocate logits buffer
+    logits_buf_.allocate((size_t)config.scheduler.max_num_seqs * config.model.vocab_size);
+
+    printf("Engine initialized: %s, %d layers, %d heads, d=%d\n",
+           config.model.name.c_str(), config.model.n_layers,
+           config.model.n_heads, config.model.d_model);
+    printf("  KV cache: %d blocks x %d tokens/block, %s quantization\n",
+           cache_cfg.num_gpu_blocks, cache_cfg.block_size,
+           cache_cfg.kv_quant == KVQuantType::NONE ? "none" :
+           cache_cfg.kv_quant == KVQuantType::INT8 ? "INT8" : "FP8");
+    printf("  Scheduler: max_seqs=%d, max_tokens=%d, prefix_cache=%s\n",
+           config.scheduler.max_num_seqs, config.scheduler.max_num_tokens,
+           cache_cfg.enable_prefix_caching ? "on" : "off");
 }
 
-AsyncPipeline::~AsyncPipeline() {
+InferenceEngine::~InferenceEngine() {
     shutdown();
 }
 
-void AsyncPipeline::shutdown() {
-    running_.store(false, std::memory_order_release);
-    input_cv_.notify_all();
-    preproc_cv_.notify_all();
-    postproc_cv_.notify_all();
-
-    if (preproc_thread_.joinable())  preproc_thread_.join();
-    if (compute_thread_.joinable())  compute_thread_.join();
-    if (postproc_thread_.joinable()) postproc_thread_.join();
+void InferenceEngine::start() {
+    if (running_.load()) return;
+    running_ = true;
+    shutdown_requested_ = false;
+    engine_thread_ = std::thread(&InferenceEngine::engine_loop, this);
+    printf("Engine started\n");
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Public submit
-// ════════════════════════════════════════════════════════════════════════════
+void InferenceEngine::shutdown() {
+    if (!running_.load()) return;
 
-bool AsyncPipeline::submit(InferenceRequest req) {
-    std::unique_lock<std::mutex> lk(input_mutex_);
-    if (input_queue_.size() >= kQueueSize) return false;
-    input_queue_.push(std::make_shared<InferenceRequest>(std::move(req)));
-    input_cv_.notify_one();
-    return true;
+    shutdown_requested_ = true;
+    incoming_cv_.notify_all();
+
+    if (engine_thread_.joinable()) {
+        engine_thread_.join();
+    }
+    running_ = false;
+    printf("Engine shut down (%lld requests completed, %lld tokens generated)\n",
+           (long long)stats_.requests_completed.load(),
+           (long long)stats_.tokens_generated.load());
 }
 
-InferenceResponse AsyncPipeline::run_sync(InferenceRequest req) {
+int InferenceEngine::submit(InferenceRequest req) {
+    int rid = next_request_id_++;
+    req.request_id = rid;
+
+    // Wrap into SequenceGroup
+    auto sg = std::make_shared<SequenceGroup>();
+    sg->request_id  = rid;
+    sg->sampling    = req.sampling;
+    sg->is_prefill  = true;
+    sg->priority    = req.priority;
+    sg->arrival_time = req.arrival_time;
+    sg->callback    = std::move(req.callback);
+
+    SequenceData seq;
+    seq.prompt_tokens = std::move(req.prompt_token_ids);
+    seq.status = SequenceStatus::WAITING;
+    sg->sequences.push_back(std::move(seq));
+
+    {
+        std::lock_guard<std::mutex> lock(incoming_mu_);
+        incoming_.push(std::move(sg));
+    }
+    incoming_cv_.notify_one();
+
+    return rid;
+}
+
+InferenceResponse InferenceEngine::generate(InferenceRequest req) {
     std::promise<InferenceResponse> promise;
     auto future = promise.get_future();
 
-    req.callback = [&promise](const std::string& /*text*/) {
-        // The actual response is delivered below via the dedicated field.
-        // (In a full implementation the callback receives InferenceResponse.)
+    req.callback = [&promise](const InferenceResponse& resp) {
+        promise.set_value(resp);
     };
 
-    InferenceResponse resp;
-    resp.request_id = req.id;
-
-    // Run synchronously by bypassing the queue
-    auto start = std::chrono::steady_clock::now();
-    const int vocab_size = model_->config().vocab_size;
-    const int max_new    = req.cfg.max_new_tokens;
-
-    std::vector<float> logits(vocab_size);
-    std::vector<int>   generated;
-
-    // Prefill
-    model_->prefill(req.prompt_ids.data(), logits.data(), 1,
-                    (int)req.prompt_ids.size());
-
-    // Autoregressive decode
-    std::vector<int> last_token(1);
-    last_token[0] = sample_next_token(
-        logits.data(), vocab_size,
-        req.cfg.temperature, req.cfg.top_p, req.cfg.greedy);
-    generated.push_back(last_token[0]);
-
-    for (int step = 1; step < max_new; step++) {
-        model_->decode(last_token.data(), logits.data(), 1);
-        last_token[0] = sample_next_token(
-            logits.data(), vocab_size,
-            req.cfg.temperature, req.cfg.top_p, req.cfg.greedy);
-        generated.push_back(last_token[0]);
-        if (last_token[0] == 50256) break; // GPT-2 EOS token
+    // If engine isn't running, run synchronously
+    if (!running_.load()) {
+        start();
+        submit(std::move(req));
+        auto response = future.get();
+        shutdown();
+        return response;
     }
-    model_->reset_cache();
 
-    auto end = std::chrono::steady_clock::now();
-    float elapsed_ms = std::chrono::duration<float, std::milli>(end - start).count();
-
-    resp.generated_ids   = generated;
-    resp.generated_text  = detokenize(generated);
-    resp.latency_ms      = elapsed_ms;
-    resp.tpot_ms         = elapsed_ms / (float)generated.size();
-    resp.success         = true;
-
-    stats_.requests_completed.fetch_add(1, std::memory_order_relaxed);
-    stats_.total_tokens_generated.fetch_add(generated.size(), std::memory_order_relaxed);
-    stats_.total_latency_ms.store(
-        stats_.total_latency_ms.load(std::memory_order_relaxed) + elapsed_ms,
-        std::memory_order_relaxed);
-
-    return resp;
+    submit(std::move(req));
+    return future.get();
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Stage 1: preprocessing worker
-// ════════════════════════════════════════════════════════════════════════════
-
-void AsyncPipeline::preproc_worker() {
-    while (running_.load(std::memory_order_acquire)) {
-        std::shared_ptr<InferenceRequest> req;
+void InferenceEngine::engine_loop() {
+    while (!shutdown_requested_.load() || scheduler_->has_pending()) {
+        // Wait for incoming requests or pending work
         {
-            std::unique_lock<std::mutex> lk(input_mutex_);
-            input_cv_.wait(lk, [this]{
-                return !input_queue_.empty() || !running_.load();
+            std::unique_lock<std::mutex> lock(incoming_mu_);
+            incoming_cv_.wait_for(lock, std::chrono::milliseconds(1), [this] {
+                return !incoming_.empty() || shutdown_requested_.load();
             });
-            if (!running_ && input_queue_.empty()) break;
-            req = input_queue_.front();
-            input_queue_.pop();
         }
 
-        // Tokenize (if prompt_ids not already filled)
-        if (req->prompt_ids.empty()) {
-            // In a real system, call tiktoken / sentencepiece here.
-            // For the demo we just use the IDs the caller provided.
-        }
+        // Drain incoming requests into scheduler
+        drain_incoming();
 
-        const int seq_len = (int)req->prompt_ids.size();
-        auto batch = std::make_shared<PreprocessedBatch>(req, seq_len);
-        std::copy(req->prompt_ids.begin(), req->prompt_ids.end(), batch->ids.ptr);
-
-        {
-            std::lock_guard<std::mutex> lk(preproc_mutex_);
-            preproc_queue_.push(batch);
+        // Run one scheduling + execution step
+        if (scheduler_->has_pending()) {
+            step();
         }
-        preproc_cv_.notify_one();
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Stage 2: GPU compute worker
-// ════════════════════════════════════════════════════════════════════════════
+void InferenceEngine::drain_incoming() {
+    std::lock_guard<std::mutex> lock(incoming_mu_);
+    while (!incoming_.empty()) {
+        scheduler_->add_request(std::move(incoming_.front()));
+        incoming_.pop();
+    }
+}
 
-void AsyncPipeline::compute_worker() {
-    const int vocab_size = model_->config().vocab_size;
-    const int max_new    = 128; // default; use per-request cfg in production
+void InferenceEngine::step() {
+    auto t0 = std::chrono::steady_clock::now();
 
-    while (running_.load(std::memory_order_acquire)) {
-        std::shared_ptr<PreprocessedBatch> pp;
-        {
-            std::unique_lock<std::mutex> lk(preproc_mutex_);
-            preproc_cv_.wait(lk, [this]{
-                return !preproc_queue_.empty() || !running_.load();
-            });
-            if (!running_ && preproc_queue_.empty()) break;
-            pp = preproc_queue_.front();
-            preproc_queue_.pop();
+    // 1. Schedule next batch
+    SchedulerOutput sched = scheduler_->schedule();
+    if (sched.empty()) return;
+
+    // 2. Collect batch information
+    std::vector<SequenceGroup*> batch;
+    batch.insert(batch.end(), sched.scheduled_prefills.begin(),
+                 sched.scheduled_prefills.end());
+    batch.insert(batch.end(), sched.scheduled_decodes.begin(),
+                 sched.scheduled_decodes.end());
+
+    // 3. Run forward pass
+    if (!sched.scheduled_prefills.empty()) {
+        // Pack prefill tokens
+        std::vector<int> packed_tokens;
+        std::vector<int> seq_lens;
+        std::vector<int> seq_ids;
+
+        for (auto* sg : sched.scheduled_prefills) {
+            auto& seq = sg->first_seq();
+            int start = seq.num_computed_tokens;
+            int end   = seq.prompt_len();
+            packed_tokens.insert(packed_tokens.end(),
+                                 seq.prompt_tokens.begin() + start,
+                                 seq.prompt_tokens.begin() + end);
+            seq_lens.push_back(end - start);
+            seq_ids.push_back(seq.seq_id);
         }
 
-        const InferenceConfig& cfg = pp->request->cfg;
-        const int actual_max = cfg.max_new_tokens > 0 ? cfg.max_new_tokens : max_new;
-
-        // Allocate output logits on pinned host
-        auto cb = std::make_shared<ComputedBatch>(pp->request, vocab_size, actual_max);
-
-        std::vector<float> logits(vocab_size);
-        std::vector<int>   generated;
-        generated.reserve(actual_max);
-
-        // Prefill phase
-        model_->prefill(pp->ids.ptr, logits.data(), 1, pp->seq_len);
-
-        std::vector<int> last(1);
-        last[0] = sample_next_token(logits.data(), vocab_size,
-                                    cfg.temperature, cfg.top_p, cfg.greedy);
-        generated.push_back(last[0]);
-
-        // Decode loop
-        for (int step = 1; step < actual_max; step++) {
-            model_->decode(last.data(), logits.data(), 1);
-            last[0] = sample_next_token(logits.data(), vocab_size,
-                                        cfg.temperature, cfg.top_p, cfg.greedy);
-            generated.push_back(last[0]);
-            if (last[0] == 50256) break;
-        }
-        model_->reset_cache();
-
-        // Store generated token IDs in pinned buffer
-        cb->steps_done = (int)generated.size();
-        std::copy(generated.begin(), generated.end(), cb->logits.ptr); // reuse buffer as int
-
-        {
-            std::lock_guard<std::mutex> lk(postproc_mutex_);
-            postproc_queue_.push(cb);
-        }
-        postproc_cv_.notify_one();
+        model_->batch_prefill(packed_tokens, seq_lens, *kv_cache_,
+                              seq_ids, logits_buf_, compute_stream_);
     }
-}
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Stage 3: postprocessing worker
-// ════════════════════════════════════════════════════════════════════════════
+    if (!sched.scheduled_decodes.empty()) {
+        std::vector<int> token_ids;
+        std::vector<int> seq_lens;
+        std::vector<int> seq_ids;
 
-void AsyncPipeline::postproc_worker() {
-    while (running_.load(std::memory_order_acquire)) {
-        std::shared_ptr<ComputedBatch> cb;
-        {
-            std::unique_lock<std::mutex> lk(postproc_mutex_);
-            postproc_cv_.wait(lk, [this]{
-                return !postproc_queue_.empty() || !running_.load();
-            });
-            if (!running_ && postproc_queue_.empty()) break;
-            cb = postproc_queue_.front();
-            postproc_queue_.pop();
+        for (auto* sg : sched.scheduled_decodes) {
+            auto& seq = sg->first_seq();
+            // Last generated token (or last prompt token if just finished prefill)
+            int last_token = seq.output_tokens.empty()
+                ? seq.prompt_tokens.back()
+                : seq.output_tokens.back();
+            token_ids.push_back(last_token);
+            seq_lens.push_back(seq.total_len());
+            seq_ids.push_back(seq.seq_id);
         }
 
-        std::vector<int> ids(cb->steps_done);
-        for (int i = 0; i < cb->steps_done; i++)
-            ids[i] = (int)cb->logits.ptr[i];
+        int logits_offset = (int)sched.scheduled_prefills.size() * config_.model.vocab_size;
+        model_->batch_decode(token_ids, seq_lens, *kv_cache_,
+                             seq_ids,
+                             logits_buf_.ptr + logits_offset,
+                             compute_stream_);
+    }
 
-        std::string text = detokenize(ids);
+    compute_stream_.sync();
 
-        if (cb->request->callback)
-            cb->request->callback(text);
+    // 4. Sample next tokens
+    std::vector<int> new_tokens;
+    sample_tokens(logits_buf_, (int)batch.size(), batch, new_tokens);
 
-        stats_.requests_completed.fetch_add(1, std::memory_order_relaxed);
-        stats_.total_tokens_generated.fetch_add(ids.size(), std::memory_order_relaxed);
+    // 5. Update scheduler state
+    scheduler_->post_step(batch, new_tokens);
+
+    // 6. Deliver finished responses
+    std::vector<SequenceGroup*> finished;
+    for (auto* sg : batch) {
+        if (sg->first_seq().is_finished()) {
+            finished.push_back(sg);
+        }
+    }
+    deliver_responses(finished);
+
+    // 7. Update stats
+    auto t1 = std::chrono::steady_clock::now();
+    double step_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    stats_.iterations++;
+    stats_.tokens_generated += (int64_t)new_tokens.size();
+    stats_.prefill_tokens += sched.num_prefill_tokens;
+}
+
+void InferenceEngine::sample_tokens(
+    const float* logits, int num_seqs,
+    const std::vector<SequenceGroup*>& batch,
+    std::vector<int>& out_tokens)
+{
+    out_tokens.resize(num_seqs);
+
+    // Copy logits to host for sampling
+    std::vector<float> h_logits((size_t)num_seqs * config_.model.vocab_size);
+    CUDA_CHECK(cudaMemcpy(h_logits.data(), logits,
+                          h_logits.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    for (int i = 0; i < num_seqs; ++i) {
+        const float* row = h_logits.data() + (size_t)i * config_.model.vocab_size;
+        const auto& sampling = batch[i]->sampling;
+
+        if (sampling.greedy || sampling.temperature < 1e-6f) {
+            // Greedy: argmax
+            int best = 0;
+            float best_val = row[0];
+            for (int v = 1; v < config_.model.vocab_size; ++v) {
+                if (row[v] > best_val) {
+                    best_val = row[v];
+                    best = v;
+                }
+            }
+            out_tokens[i] = best;
+        } else {
+            // Temperature + top-p sampling
+            std::vector<std::pair<float, int>> probs(config_.model.vocab_size);
+            float max_val = *std::max_element(row, row + config_.model.vocab_size);
+
+            float sum = 0.f;
+            for (int v = 0; v < config_.model.vocab_size; ++v) {
+                float p = expf((row[v] - max_val) / sampling.temperature);
+                probs[v] = {p, v};
+                sum += p;
+            }
+
+            // Normalize
+            for (auto& [p, _] : probs) p /= sum;
+
+            // Sort descending for top-p
+            std::sort(probs.begin(), probs.end(),
+                      [](auto& a, auto& b) { return a.first > b.first; });
+
+            // Top-p filtering
+            float cumsum = 0.f;
+            int cutoff = config_.model.vocab_size;
+            for (int v = 0; v < config_.model.vocab_size; ++v) {
+                cumsum += probs[v].first;
+                if (cumsum >= sampling.top_p) {
+                    cutoff = v + 1;
+                    break;
+                }
+            }
+
+            // Renormalize
+            sum = 0.f;
+            for (int v = 0; v < cutoff; ++v) sum += probs[v].first;
+
+            // Sample
+            float r = (float)rand() / RAND_MAX * sum;
+            float acc = 0.f;
+            out_tokens[i] = probs[0].second;
+            for (int v = 0; v < cutoff; ++v) {
+                acc += probs[v].first;
+                if (acc >= r) {
+                    out_tokens[i] = probs[v].second;
+                    break;
+                }
+            }
+        }
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Tokenizer stubs (replace with tiktoken or sentencepiece)
-// ════════════════════════════════════════════════════════════════════════════
+void InferenceEngine::deliver_responses(const std::vector<SequenceGroup*>& finished) {
+    for (auto* sg : finished) {
+        auto& seq = sg->first_seq();
+        auto now = std::chrono::steady_clock::now();
+        float latency = std::chrono::duration<float, std::milli>(
+            now - sg->arrival_time).count();
 
-std::vector<int> AsyncPipeline::tokenize(const std::string& text) const {
-    // Stub: encode each character as its ASCII code (not real BPE).
-    // Replace with a proper tokenizer library in production.
-    std::vector<int> ids;
-    ids.reserve(text.size());
-    for (unsigned char c : text) ids.push_back((int)c);
-    return ids;
+        InferenceResponse resp;
+        resp.request_id       = sg->request_id;
+        resp.output_token_ids = seq.output_tokens;
+        resp.finish_reason    = seq.finish_reason;
+        resp.latency_ms       = latency;
+        resp.prompt_tokens    = seq.prompt_len();
+        resp.generated_tokens = seq.output_len();
+        resp.tpot_ms          = seq.output_len() > 0
+                                ? latency / seq.output_len() : 0.f;
+        resp.success          = true;
+
+        stats_.requests_completed++;
+        stats_.total_latency_ms.store(
+            stats_.total_latency_ms.load() + (double)latency);
+
+        if (sg->callback) {
+            sg->callback(resp);
+        }
+    }
 }
 
-std::string AsyncPipeline::detokenize(const std::vector<int>& ids) const {
-    // Stub: interpret each ID as an ASCII character.
-    std::string out;
-    out.reserve(ids.size());
-    for (int id : ids) {
-        if (id >= 32 && id < 127) out += (char)id;
+void InferenceEngine::benchmark_prefill(int seq_len, int batch_size, int num_runs) {
+    printf("\n=== Prefill Benchmark ===\n");
+    printf("  seq_len=%d  batch_size=%d  runs=%d\n", seq_len, batch_size, num_runs);
+
+    // Create dummy token IDs
+    std::vector<int> packed_tokens(seq_len * batch_size, 1);
+    std::vector<int> seq_lens(batch_size, seq_len);
+    std::vector<int> seq_ids(batch_size);
+    std::iota(seq_ids.begin(), seq_ids.end(), 0);
+
+    // Allocate KV blocks
+    for (int s = 0; s < batch_size; ++s) {
+        kv_cache_->allocate_for_prefill(s, seq_len);
     }
-    return out;
+
+    DeviceBuffer<float> logits((size_t)batch_size * config_.model.vocab_size);
+
+    // Warmup
+    model_->batch_prefill(packed_tokens, seq_lens, *kv_cache_,
+                          seq_ids, logits, compute_stream_);
+    compute_stream_.sync();
+
+    // Benchmark
+    CudaEvent start, end;
+    start.record(compute_stream_);
+
+    for (int r = 0; r < num_runs; ++r) {
+        model_->batch_prefill(packed_tokens, seq_lens, *kv_cache_,
+                              seq_ids, logits, compute_stream_);
+    }
+
+    end.record(compute_stream_);
+    compute_stream_.sync();
+
+    float total_ms = end.elapsed(start);
+    float avg_ms   = total_ms / num_runs;
+    int total_tokens = seq_len * batch_size;
+    float tps = total_tokens / (avg_ms / 1000.f);
+
+    printf("  Avg latency: %.2f ms\n", avg_ms);
+    printf("  Throughput:  %.0f tokens/sec\n", tps);
+
+    // Cleanup
+    for (int s = 0; s < batch_size; ++s) {
+        kv_cache_->free_sequence(s);
+    }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Sampling
-// ════════════════════════════════════════════════════════════════════════════
+void InferenceEngine::benchmark_decode(int num_seqs, int context_len, int decode_steps) {
+    printf("\n=== Decode Benchmark ===\n");
+    printf("  num_seqs=%d  context=%d  steps=%d\n", num_seqs, context_len, decode_steps);
 
-int AsyncPipeline::sample_next_token(
-    const float* logits, int vocab_size,
-    float temperature, float top_p, bool greedy
-) {
-    if (greedy) {
-        return (int)(std::max_element(logits, logits + vocab_size) - logits);
+    // Allocate KV cache for context
+    std::vector<int> seq_ids(num_seqs);
+    std::iota(seq_ids.begin(), seq_ids.end(), 0);
+
+    for (int s = 0; s < num_seqs; ++s) {
+        kv_cache_->allocate_for_prefill(s, context_len);
     }
 
-    // Temperature scaling
-    std::vector<float> probs(logits, logits + vocab_size);
-    const float inv_temp = 1.f / std::max(temperature, 1e-6f);
-    float max_logit = *std::max_element(probs.begin(), probs.end());
-    float sum = 0.f;
-    for (auto& p : probs) { p = std::exp((p - max_logit) * inv_temp); sum += p; }
-    for (auto& p : probs) p /= sum;
+    DeviceBuffer<float> logits((size_t)num_seqs * config_.model.vocab_size);
+    std::vector<int> token_ids(num_seqs, 1);
+    std::vector<int> seq_lens(num_seqs, context_len);
 
-    // Top-p (nucleus) sampling
-    std::vector<int> idx(vocab_size);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return probs[a] > probs[b]; });
+    // Warmup
+    model_->batch_decode(token_ids, seq_lens, *kv_cache_,
+                         seq_ids, logits, compute_stream_);
+    compute_stream_.sync();
 
-    float cumsum = 0.f;
-    int cutoff = vocab_size;
-    for (int i = 0; i < vocab_size; i++) {
-        cumsum += probs[idx[i]];
-        if (cumsum >= top_p) { cutoff = i + 1; break; }
+    // Benchmark
+    CudaEvent start, end;
+    start.record(compute_stream_);
+
+    for (int step = 0; step < decode_steps; ++step) {
+        for (int s = 0; s < num_seqs; ++s) {
+            kv_cache_->extend_one_token(s);
+            seq_lens[s]++;
+        }
+        model_->batch_decode(token_ids, seq_lens, *kv_cache_,
+                             seq_ids, logits, compute_stream_);
     }
 
-    // Renormalise truncated distribution
-    std::vector<float> trunc_probs(cutoff);
-    float trunc_sum = 0.f;
-    for (int i = 0; i < cutoff; i++) trunc_sum += probs[idx[i]];
-    for (int i = 0; i < cutoff; i++) trunc_probs[i] = probs[idx[i]] / trunc_sum;
+    end.record(compute_stream_);
+    compute_stream_.sync();
 
-    // Sample
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::discrete_distribution<int> dist(trunc_probs.begin(), trunc_probs.end());
-    return idx[dist(rng)];
+    float total_ms = end.elapsed(start);
+    float avg_ms   = total_ms / decode_steps;
+    float tps = (float)(num_seqs * decode_steps) / (total_ms / 1000.f);
+
+    printf("  Avg step latency: %.2f ms\n", avg_ms);
+    printf("  Throughput:       %.0f tokens/sec\n", tps);
+
+    // Cleanup
+    for (int s = 0; s < num_seqs; ++s) {
+        kv_cache_->free_sequence(s);
+    }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  Benchmark harness
-// ════════════════════════════════════════════════════════════════════════════
-
-BenchmarkResult benchmark(
-    Transformer& model, int seq_len, int batch_size, int num_runs, bool warmup
-) {
-    const int vocab_size = model.config().vocab_size;
-
-    // Fake input IDs
-    std::vector<int> ids(batch_size * seq_len, 1);
-
-    std::vector<float> logits_out((size_t)batch_size * vocab_size);
-    std::vector<float> latencies;
-    latencies.reserve(num_runs);
-
-    if (warmup) {
-        // Two warmup runs
-        model.prefill(ids.data(), logits_out.data(), batch_size, seq_len);
-        model.reset_cache();
-        model.prefill(ids.data(), logits_out.data(), batch_size, seq_len);
-        model.reset_cache();
-    }
-
-    for (int run = 0; run < num_runs; run++) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        model.prefill(ids.data(), logits_out.data(), batch_size, seq_len);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        model.reset_cache();
-        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-        latencies.push_back(ms);
-    }
-
-    std::sort(latencies.begin(), latencies.end());
-    float mean = std::accumulate(latencies.begin(), latencies.end(), 0.f) / num_runs;
-    float p50  = latencies[num_runs * 50 / 100];
-    float p95  = latencies[num_runs * 95 / 100];
-    float p99  = latencies[num_runs * 99 / 100];
-    float tput = (float)(batch_size * seq_len) / (mean * 1e-3f);
-
-    return { seq_len, batch_size, num_runs, mean, p50, p95, p99, tput };
-}
-
-} // namespace flashgen

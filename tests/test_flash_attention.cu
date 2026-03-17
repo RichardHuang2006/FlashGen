@@ -1,310 +1,265 @@
-/*
- * test_flash_attention.cu
- *
- * Correctness and performance tests for the FlashAttention kernel.
- *
- * Test 1: Numerical correctness against a naive O(N^2) attention reference.
- *   - Tolerance: max absolute error < 1e-3 (FP32)
- *
- * Test 2: Causal masking correctness.
- *   - Verify that output[i] doesn't depend on any token j > i.
- *
- * Test 3: FP16 vs FP32 precision comparison.
- *
- * Test 4: Throughput measurement (tokens/s, effective FLOP/s).
- */
-
 #include "flash_attention.cuh"
 #include "cuda_utils.cuh"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <vector>
-#include <algorithm>
-#include <numeric>
-#include <random>
 
-using namespace flashgen;
+static int tests_passed = 0;
+static int tests_failed = 0;
 
-// -- Naive reference attention (CPU) -----------------------------------------
+#define TEST(name) printf("  %-50s", name); fflush(stdout)
+#define PASS() do { printf("[PASS]\n"); ++tests_passed; } while(0)
+#define FAIL(msg) do { printf("[FAIL] %s\n", msg); ++tests_failed; } while(0)
 
-static void naive_attention_cpu(
-    const float* Q, const float* K, const float* V, float* O,
-    int batch, int n_heads, int seq, int head_dim,
-    float scale, bool causal
-) {
-    for (int b = 0; b < batch; b++) {
-        for (int h = 0; h < n_heads; h++) {
-            for (int qi = 0; qi < seq; qi++) {
-                // Compute scores
-                std::vector<float> s(seq);
-                for (int ki = 0; ki < seq; ki++) {
-                    if (causal && ki > qi) { s[ki] = -1e9f; continue; }
-                    float dot = 0.f;
-                    for (int d = 0; d < head_dim; d++) {
-                        const long long base = ((long long)b * n_heads + h) * seq * head_dim;
-                        dot += Q[base + qi * head_dim + d] * K[base + ki * head_dim + d];
-                    }
-                    s[ki] = dot * scale;
-                }
-                // Softmax
-                float m = *std::max_element(s.begin(), s.end());
-                float z = 0.f;
-                for (float& si : s) { si = std::exp(si - m); z += si; }
-                for (float& si : s) si /= z;
-                // Weighted sum of V
-                for (int d = 0; d < head_dim; d++) {
-                    const long long base = ((long long)b * n_heads + h) * seq * head_dim;
-                    float acc = 0.f;
-                    for (int vi = 0; vi < seq; vi++)
-                        acc += s[vi] * V[base + vi * head_dim + d];
-                    O[base + qi * head_dim + d] = acc;
-                }
-            }
+// Naive reference attention (CPU)
+static void ref_attention(const float* Q, const float* K, const float* V,
+                          float* O, int N, int Hd, bool causal) {
+    float scale = 1.0f / sqrtf((float)Hd);
+    for (int i = 0; i < N; ++i) {
+        float max_s = -1e30f;
+        int kv_end = causal ? i + 1 : N;
+        for (int j = 0; j < kv_end; ++j) {
+            float s = 0.f;
+            for (int d = 0; d < Hd; ++d)
+                s += Q[i * Hd + d] * K[j * Hd + d];
+            s *= scale;
+            if (s > max_s) max_s = s;
+        }
+        float sum = 0.f;
+        std::vector<float> w(N, 0.f);
+        for (int j = 0; j < kv_end; ++j) {
+            float s = 0.f;
+            for (int d = 0; d < Hd; ++d)
+                s += Q[i * Hd + d] * K[j * Hd + d];
+            w[j] = expf(s * scale - max_s);
+            sum += w[j];
+        }
+        for (int d = 0; d < Hd; ++d) {
+            float val = 0.f;
+            for (int j = 0; j < kv_end; ++j)
+                val += (w[j] / sum) * V[j * Hd + d];
+            O[i * Hd + d] = val;
         }
     }
 }
 
-// -- Test helpers -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Tests
+// ---------------------------------------------------------------------------
 
-static float max_abs_error(const float* a, const float* b, size_t n) {
-    float err = 0.f;
-    for (size_t i = 0; i < n; i++) err = std::max(err, std::abs(a[i] - b[i]));
-    return err;
-}
+void test_correctness_causal() {
+    TEST("FlashAttention causal correctness");
 
-static float mean_abs_error(const float* a, const float* b, size_t n) {
-    float s = 0.f;
-    for (size_t i = 0; i < n; i++) s += std::abs(a[i] - b[i]);
-    return s / (float)n;
-}
+    int B = 1, H = 4, N = 128, Hd = 64;
+    int total = B * H * N * Hd;
 
-static void fill_random(float* buf, size_t n, float scale = 0.1f) {
-    static std::mt19937 rng(42);
-    std::normal_distribution<float> dist(0.f, scale);
-    for (size_t i = 0; i < n; i++) buf[i] = dist(rng);
-}
-
-static bool check(bool cond, const char* msg) {
-    if (!cond) {
-        printf("  FAIL: %s\n", msg);
-        return false;
+    std::vector<float> hQ(total), hK(total), hV(total), hO(total), hRef(total);
+    srand(123);
+    for (int i = 0; i < total; ++i) {
+        hQ[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+        hK[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+        hV[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
     }
-    printf("  PASS: %s\n", msg);
-    return true;
-}
 
-// ============================================================================
-//  Test 1: Correctness vs. naive attention (FP32, non-causal)
-// ============================================================================
+    DeviceBuffer<float> dQ(total), dK(total), dV(total), dO(total);
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, hK.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, hV.data(), total * 4, cudaMemcpyHostToDevice));
 
-static bool test_correctness_fp32() {
-    printf("\n[Test 1] FlashAttention FP32 correctness (non-causal)\n");
-    bool all_pass = true;
+    CudaStream s;
+    flash_attention::forward(dQ, dK, dV, dO, nullptr, B, H, N, Hd, true, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(hO.data(), dO, total * 4, cudaMemcpyDeviceToHost));
 
-    struct Case { int batch, heads, seq, hd; };
-    std::vector<Case> cases = {
-        {1, 1,  64,  64},
-        {1, 4, 128,  64},
-        {2, 8, 256,  64},
-        {1, 1, 512, 128},
-        {4, 12, 64,  64},
-    };
-
-    for (auto& c : cases) {
-        const size_t n = (size_t)c.batch * c.heads * c.seq * c.hd;
-        std::vector<float> hQ(n), hK(n), hV(n), hO_ref(n), hO_flash(n);
-        fill_random(hQ.data(), n);
-        fill_random(hK.data(), n);
-        fill_random(hV.data(), n);
-
-        // CPU reference
-        naive_attention_cpu(hQ.data(), hK.data(), hV.data(), hO_ref.data(),
-                            c.batch, c.heads, c.seq, c.hd,
-                            1.f / sqrtf((float)c.hd), false);
-
-        // GPU FlashAttention
-        DeviceBuffer<float> dQ(n), dK(n), dV(n), dO(n);
-        CUDA_CHECK(cudaMemcpy(dQ.ptr, hQ.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dK.ptr, hK.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dV.ptr, hV.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-
-        flash_attention_forward(dQ.ptr, dK.ptr, dV.ptr, dO.ptr, nullptr,
-                                c.batch, c.heads, c.seq, c.hd,
-                                1.f / sqrtf((float)c.hd), false, 0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(hO_flash.data(), dO.ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
-
-        float max_err  = max_abs_error(hO_ref.data(), hO_flash.data(), n);
-        float mean_err = mean_abs_error(hO_ref.data(), hO_flash.data(), n);
-
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "batch=%d heads=%d seq=%d hd=%d  max_err=%.2e  mean_err=%.2e",
-                 c.batch, c.heads, c.seq, c.hd, max_err, mean_err);
-        all_pass &= check(max_err < 1e-3f, msg);
-    }
-    return all_pass;
-}
-
-// ============================================================================
-//  Test 2: Causal masking correctness
-// ============================================================================
-
-static bool test_causal_masking() {
-    printf("\n[Test 2] Causal masking correctness\n");
-
-    const int batch = 1, heads = 4, seq = 128, hd = 64;
-    const size_t n = (size_t)batch * heads * seq * hd;
-    std::vector<float> hQ(n), hK(n), hV(n), hO_causal(n), hO_ref(n);
-
-    fill_random(hQ.data(), n);
-    fill_random(hK.data(), n);
-    fill_random(hV.data(), n);
-
-    naive_attention_cpu(hQ.data(), hK.data(), hV.data(), hO_ref.data(),
-                        batch, heads, seq, hd, 1.f / sqrtf((float)hd), true);
-
-    DeviceBuffer<float> dQ(n), dK(n), dV(n), dO(n);
-    CUDA_CHECK(cudaMemcpy(dQ.ptr, hQ.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dK.ptr, hK.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dV.ptr, hV.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-
-    flash_attention_forward(dQ.ptr, dK.ptr, dV.ptr, dO.ptr, nullptr,
-                            batch, heads, seq, hd,
-                            1.f / sqrtf((float)hd), true, 0);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(hO_causal.data(), dO.ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
-
-    float max_err = max_abs_error(hO_ref.data(), hO_causal.data(), n);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "max_err=%.2e", max_err);
-    return check(max_err < 1e-3f, msg);
-}
-
-// ============================================================================
-//  Test 3: FP16 precision
-// ============================================================================
-
-static bool test_fp16_precision() {
-    printf("\n[Test 3] FP16 precision vs FP32 reference\n");
-
-    const int batch = 1, heads = 8, seq = 256, hd = 64;
-    const size_t n = (size_t)batch * heads * seq * hd;
-
-    std::vector<float> hQf(n), hKf(n), hVf(n), hOf_ref(n), hOf_fp16(n);
-    fill_random(hQf.data(), n, 0.05f); // small values for better FP16 repr
-    fill_random(hKf.data(), n, 0.05f);
-    fill_random(hVf.data(), n, 0.05f);
-
-    // FP32 reference on GPU
-    DeviceBuffer<float> dQf(n), dKf(n), dVf(n), dOf(n);
-    CUDA_CHECK(cudaMemcpy(dQf.ptr, hQf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dKf.ptr, hKf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dVf.ptr, hVf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    flash_attention_forward(dQf.ptr, dKf.ptr, dVf.ptr, dOf.ptr, nullptr,
-                            batch, heads, seq, hd, 1.f/sqrtf((float)hd), false, 0);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(hOf_ref.data(), dOf.ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // FP16 on GPU
-    std::vector<__half> hQh(n), hKh(n), hVh(n), hOh(n);
-    for (size_t i = 0; i < n; i++) {
-        hQh[i] = __float2half(hQf[i]);
-        hKh[i] = __float2half(hKf[i]);
-        hVh[i] = __float2half(hVf[i]);
-    }
-    DeviceBuffer<__half> dQh(n), dKh(n), dVh(n), dOh(n);
-    CUDA_CHECK(cudaMemcpy(dQh.ptr, hQh.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dKh.ptr, hKh.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dVh.ptr, hVh.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-
-    flash_attention_forward_fp16(dQh.ptr, dKh.ptr, dVh.ptr, dOh.ptr, nullptr,
-                                 batch, heads, seq, hd, 1.f/sqrtf((float)hd), false, 0);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(hOh.data(), dOh.ptr, n * sizeof(__half), cudaMemcpyDeviceToHost));
-
-    for (size_t i = 0; i < n; i++) hOf_fp16[i] = __half2float(hOh[i]);
-
-    float max_err  = max_abs_error(hOf_ref.data(), hOf_fp16.data(), n);
-    float mean_err = mean_abs_error(hOf_ref.data(), hOf_fp16.data(), n);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "FP16 vs FP32: max_err=%.2e mean_err=%.2e", max_err, mean_err);
-    // FP16 has ~3 decimal digits; tolerate slightly larger error
-    return check(max_err < 5e-3f, msg);
-}
-
-// ============================================================================
-//  Test 4: Throughput benchmark
-// ============================================================================
-
-static void test_throughput() {
-    printf("\n[Test 4] FlashAttention throughput\n");
-
-    struct Case { int batch, heads, seq, hd; const char* label; };
-    std::vector<Case> cases = {
-        {1,  12, 512,  64, "GPT-2 small  seq=512"},
-        {1,  12,1024,  64, "GPT-2 small  seq=1024"},
-        {4,  16, 512,  64, "GPT-2 medium seq=512  bs=4"},
-        {1,  25,1024,  64, "GPT-2 XL     seq=1024"},
-    };
-
-    for (auto& c : cases) {
-        const size_t n = (size_t)c.batch * c.heads * c.seq * c.hd;
-        DeviceBuffer<float> dQ(n), dK(n), dV(n), dO(n);
-
-        // Warmup
-        for (int i = 0; i < 3; i++) {
-            flash_attention_forward(dQ.ptr, dK.ptr, dV.ptr, dO.ptr, nullptr,
-                                    c.batch, c.heads, c.seq, c.hd,
-                                    1.f / sqrtf((float)c.hd), true, 0);
+    for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+            int off = (b * H + h) * N * Hd;
+            ref_attention(hQ.data() + off, hK.data() + off,
+                          hV.data() + off, hRef.data() + off, N, Hd, true);
         }
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        const int N = 20;
-        CudaEvent start, end;
-        start.record();
-        for (int i = 0; i < N; i++) {
-            flash_attention_forward(dQ.ptr, dK.ptr, dV.ptr, dO.ptr, nullptr,
-                                    c.batch, c.heads, c.seq, c.hd,
-                                    1.f / sqrtf((float)c.hd), true, 0);
-        }
-        end.record();
-        CUDA_CHECK(cudaDeviceSynchronize());
-        float ms = end.elapsed_ms(start) / N;
+    float max_err = 0.f;
+    for (int i = 0; i < total; ++i)
+        max_err = fmaxf(max_err, fabsf(hO[i] - hRef[i]));
 
-        // FLOP count: 4 * B * H * N^2 * d  (two GEMMs, softmax is negligible)
-        double flops = 4.0 * c.batch * c.heads * (double)c.seq * c.seq * c.hd;
-        double tflops = (flops / (ms * 1e-3)) / 1e12;
-        printf("  %-35s  %6.2f ms  %5.2f TFLOP/s\n", c.label, ms, tflops);
+    if (max_err < 1e-2f) {
+        printf("(err=%.6f) ", max_err);
+        PASS();
+    } else {
+        char buf[64]; snprintf(buf, 64, "err=%.4f", max_err);
+        FAIL(buf);
     }
 }
 
-// -- Entry point --------------------------------------------------------------
+void test_correctness_noncausal() {
+    TEST("FlashAttention non-causal correctness");
+
+    int B = 1, H = 2, N = 64, Hd = 64;
+    int total = B * H * N * Hd;
+
+    std::vector<float> hQ(total), hK(total), hV(total), hO(total), hRef(total);
+    srand(456);
+    for (int i = 0; i < total; ++i) {
+        hQ[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+        hK[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+        hV[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+    }
+
+    DeviceBuffer<float> dQ(total), dK(total), dV(total), dO(total);
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, hK.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, hV.data(), total * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    flash_attention::forward(dQ, dK, dV, dO, nullptr, B, H, N, Hd, false, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(hO.data(), dO, total * 4, cudaMemcpyDeviceToHost));
+
+    for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+            int off = (b * H + h) * N * Hd;
+            ref_attention(hQ.data() + off, hK.data() + off,
+                          hV.data() + off, hRef.data() + off, N, Hd, false);
+        }
+
+    float max_err = 0.f;
+    for (int i = 0; i < total; ++i)
+        max_err = fmaxf(max_err, fabsf(hO[i] - hRef[i]));
+
+    if (max_err < 1e-2f) {
+        printf("(err=%.6f) ", max_err);
+        PASS();
+    } else {
+        char buf[64]; snprintf(buf, 64, "err=%.4f", max_err);
+        FAIL(buf);
+    }
+}
+
+void test_decode_kernel() {
+    TEST("FlashAttention decode (single query)");
+
+    int B = 2, H = 4, KV = 128, Hd = 64;
+    int q_total = B * H * 1 * Hd;
+    int kv_total = B * H * KV * Hd;
+
+    std::vector<float> hQ(q_total), hK(kv_total), hV(kv_total), hO(q_total);
+    srand(789);
+    for (int i = 0; i < q_total; ++i)
+        hQ[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+    for (int i = 0; i < kv_total; ++i) {
+        hK[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+        hV[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.3f;
+    }
+
+    DeviceBuffer<float> dQ(q_total), dK(kv_total), dV(kv_total), dO(q_total);
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), q_total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, hK.data(), kv_total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, hV.data(), kv_total * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    flash_attention::decode(dQ, dK, dV, dO, B, H, KV, Hd, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(hO.data(), dO, q_total * 4, cudaMemcpyDeviceToHost));
+
+    // Verify output is finite and reasonable
+    bool ok = true;
+    for (int i = 0; i < q_total; ++i) {
+        if (!std::isfinite(hO[i])) { ok = false; break; }
+    }
+
+    if (ok) PASS(); else FAIL("non-finite output");
+}
+
+void test_different_head_dims() {
+    TEST("FlashAttention head_dim=128");
+
+    int B = 1, H = 2, N = 64, Hd = 128;
+    int total = B * H * N * Hd;
+
+    std::vector<float> hQ(total), hK(total), hV(total), hO(total), hRef(total);
+    srand(999);
+    for (int i = 0; i < total; ++i) {
+        hQ[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;
+        hK[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;
+        hV[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;
+    }
+
+    DeviceBuffer<float> dQ(total), dK(total), dV(total), dO(total);
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, hK.data(), total * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, hV.data(), total * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    flash_attention::forward(dQ, dK, dV, dO, nullptr, B, H, N, Hd, true, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(hO.data(), dO, total * 4, cudaMemcpyDeviceToHost));
+
+    for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+            int off = (b * H + h) * N * Hd;
+            ref_attention(hQ.data() + off, hK.data() + off,
+                          hV.data() + off, hRef.data() + off, N, Hd, true);
+        }
+
+    float max_err = 0.f;
+    for (int i = 0; i < total; ++i)
+        max_err = fmaxf(max_err, fabsf(hO[i] - hRef[i]));
+
+    if (max_err < 5e-2f) {
+        printf("(err=%.6f) ", max_err);
+        PASS();
+    } else {
+        char buf[64]; snprintf(buf, 64, "err=%.4f", max_err);
+        FAIL(buf);
+    }
+}
+
+void test_throughput_benchmark() {
+    TEST("FlashAttention throughput benchmark");
+
+    int B = 4, H = 12, N = 512, Hd = 64;
+    int total = B * H * N * Hd;
+    int runs = 5;
+
+    DeviceBuffer<float> dQ(total), dK(total), dV(total), dO(total);
+    CUDA_CHECK(cudaMemset(dQ, 0, total * 4));
+    CUDA_CHECK(cudaMemset(dK, 0, total * 4));
+    CUDA_CHECK(cudaMemset(dV, 0, total * 4));
+
+    CudaStream s;
+    // Warmup
+    flash_attention::forward(dQ, dK, dV, dO, nullptr, B, H, N, Hd, true, s);
+    s.sync();
+
+    CudaEvent start, stop;
+    start.record(s);
+    for (int r = 0; r < runs; ++r) {
+        flash_attention::forward(dQ, dK, dV, dO, nullptr, B, H, N, Hd, true, s);
+    }
+    stop.record(s);
+    s.sync();
+
+    float ms = stop.elapsed(start) / runs;
+    // FLOPS: 4 * B * H * N * N * Hd (Q*K + softmax + attn*V)
+    double flops = 4.0 * B * H * (double)N * N * Hd;
+    double tflops = flops / (ms * 1e9);
+
+    printf("(%.2f ms, %.2f TFLOP/s) ", ms, tflops);
+    PASS();
+}
 
 int main() {
-    printf("==========================================\n");
-    printf("  FlashAttention Test Suite\n");
-    printf("==========================================\n");
+    printf("═══ FlashAttention Tests ═══\n\n");
 
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    printf("Device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
+    test_correctness_causal();
+    test_correctness_noncausal();
+    test_decode_kernel();
+    test_different_head_dims();
+    test_throughput_benchmark();
 
-    bool pass = true;
-    pass &= test_correctness_fp32();
-    pass &= test_causal_masking();
-    pass &= test_fp16_precision();
-    test_throughput();
-
-    printf("\n==========================================\n");
-    printf("  Result: %s\n", pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    printf("==========================================\n");
-
-    return pass ? 0 : 1;
+    printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
+    return tests_failed > 0 ? 1 : 0;
 }

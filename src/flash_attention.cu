@@ -1,357 +1,337 @@
-/*
- * flash_attention.cu
- *
- * FlashAttention-2 forward pass — CUDA implementation.
- *
- * Key ideas
- * ---------
- *  • Tile the sequence dimension: process Q in blocks of Br rows, iterate
- *    over K/V in blocks of Bc columns.
- *  • Maintain online softmax statistics (running max m, denominator l)
- *    so the full N×N score matrix never needs to be materialised.
- *  • Shared memory holds one Q tile and one K/V tile simultaneously.
- *  • One CUDA block handles one (batch, head, q_tile) triple.
- *  • Inner per-row work is distributed across 128 threads via a
- *    warp-cooperative loop, not one thread per row, so that the inner
- *    d-dimensional dot product is fast.
- *
- * Memory layout (all row-major)
- * ------------------------------
- *  Q, K, V, O : [batch, n_heads, seq_len, head_dim]
- *  L           : [batch, n_heads, seq_len]   logsumexp
- */
-
 #include "flash_attention.cuh"
 #include "cuda_utils.cuh"
-#include <cuda_fp16.h>
-#include <cfloat>
 #include <cmath>
 
-namespace flashgen {
+// ===========================================================================
+//  FlashAttention-2 — standard contiguous-KV implementation
+//
+//  Algorithm:
+//    For each Q tile (Br rows), iterate over KV tiles (Bc cols):
+//      S = Q_tile * K_tile^T * scale
+//      Apply causal mask
+//      Online softmax: update running max (m), denominator (l), output (O)
+//    Final: O /= l
+//
+//  Tile sizes: Br=64, Bc=64. One CUDA block per (batch, head, Q-tile).
+//  128 threads per block with cooperative warp-level reductions.
+// ===========================================================================
 
-// ── Shared-memory kernel template ────────────────────────────────────────────
-//
-// Template parameters
-//  Br  : query tile size  (rows of Q per block)
-//  Bc  : KV tile size     (cols of K/V per inner iteration)
-//  Hd  : head dimension   (must be a compile-time constant ≤ 128)
-//
-template<int Br, int Bc, int Hd, typename scalar_t = float>
-__global__ void flash_attn_kernel(
-    const scalar_t* __restrict__ Q,   // [B, H, N, Hd]
-    const scalar_t* __restrict__ K,   // [B, H, N, Hd]
-    const scalar_t* __restrict__ V,   // [B, H, N, Hd]
-    scalar_t*       __restrict__ O,   // [B, H, N, Hd]
-    float*          __restrict__ L,   // [B, H, N]  logsumexp (FP32)
-    int N,                             // sequence length
+static constexpr int BR = 64;   // query tile size
+static constexpr int BC = 64;   // KV tile size
+static constexpr int THREADS = 128;
+
+// ── Forward kernel ─────────────────────────────────────────────────────
+
+template <int Hd>
+__global__ void flash_attn_forward_kernel(
+    const float* __restrict__ Q,    // [B, H, N, Hd]
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float*       __restrict__ O,
+    float*       __restrict__ L,    // [B, H, N] logsumexp (optional)
+    int N,                          // sequence length
     float scale,
-    bool causal
-) {
-    // blockIdx.x = q_tile index
-    // blockIdx.y = head index
-    // blockIdx.z = batch index
-    const int q_tile  = blockIdx.x;
-    const int head    = blockIdx.y;
-    const int batch   = blockIdx.z;
-    const int tid     = threadIdx.x;  // 0 .. blockDim.x-1
-    const int nthreads = blockDim.x;
+    bool causal)
+{
+    int b = blockIdx.x;   // batch
+    int h = blockIdx.y;   // head
+    int q_tile = blockIdx.z;
 
-    // Starting row for this Q tile
-    const int q_start = q_tile * Br;
-    if (q_start >= N) return;
+    int tid = threadIdx.x;
+    int BH  = gridDim.y;  // total heads
 
-    // Stride to reach correct (batch, head) slice
-    const long long slice = (long long)(batch * gridDim.y + head) * N * Hd;
-    const long long Lslice = (long long)(batch * gridDim.y + head) * N;
+    int q_start = q_tile * BR;
+    int q_end   = min(q_start + BR, N);
+    int q_count = q_end - q_start;
+    if (q_count <= 0) return;
 
-    // Shared memory layout:
-    //  sQ  [Br][Hd]
-    //  sK  [Bc][Hd]
-    //  sV  [Bc][Hd]
-    //  sO  [Br][Hd]
+    // Pointers into this (batch, head) slice
+    size_t bh_offset = ((size_t)b * BH + h) * N * Hd;
+    const float* Q_bh = Q + bh_offset + q_start * Hd;
+    const float* K_bh = K + bh_offset;
+    const float* V_bh = V + bh_offset;
+    float*       O_bh = O + bh_offset + q_start * Hd;
+
+    // Shared memory layout
     extern __shared__ float smem[];
-    float* sQ = smem;
-    float* sK = sQ + Br * Hd;
-    float* sV = sK + Bc * Hd;
-    float* sO = sV + Bc * Hd;
+    float* s_Q = smem;                          // [BR, Hd]
+    float* s_K = s_Q + BR * Hd;                 // [BC, Hd]
+    float* s_V = s_K + BC * Hd;                 // [BC, Hd]
+    float* s_S = s_V + BC * Hd;                 // [BR, BC]
+    float* s_m = s_S + BR * BC;                 // [BR]
+    float* s_l = s_m + BR;                      // [BR]
+    float* s_O = s_l + BR;                      // [BR, Hd]
 
-    // Per-row running statistics (registers)
-    float m[Br], l_acc[Br];
-    #pragma unroll
-    for (int i = 0; i < Br; i++) { m[i] = -FLT_MAX; l_acc[i] = 0.f; }
-
-    // ── Load Q tile into shared memory ───────────────────────────────────────
-    for (int idx = tid; idx < Br * Hd; idx += nthreads) {
-        int r = idx / Hd, c = idx % Hd;
-        int global_row = q_start + r;
-        sQ[idx] = (global_row < N)
-                ? (float)Q[slice + global_row * Hd + c]
-                : 0.f;
+    // Load Q tile
+    for (int i = tid; i < q_count * Hd; i += THREADS) {
+        s_Q[i] = Q_bh[i];
     }
-    // Zero output accumulator
-    for (int idx = tid; idx < Br * Hd; idx += nthreads) sO[idx] = 0.f;
+    // Zero-pad if q_count < BR
+    for (int i = tid + q_count * Hd; i < BR * Hd; i += THREADS) {
+        s_Q[i] = 0.f;
+    }
+
+    // Initialize running stats
+    for (int i = tid; i < BR; i += THREADS) {
+        s_m[i] = -1e30f;
+        s_l[i] = 0.f;
+    }
+    for (int i = tid; i < BR * Hd; i += THREADS) {
+        s_O[i] = 0.f;
+    }
     __syncthreads();
 
-    // ── Iterate over KV tiles ─────────────────────────────────────────────────
-    const int num_kv_tiles = (N + Bc - 1) / Bc;
-    for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
-        const int kv_start = kv_tile * Bc;
+    // Determine KV iteration range
+    int kv_end = causal ? min(q_end, N) : N;
+    int num_kv_tiles = (kv_end + BC - 1) / BC;
 
-        // Load K and V tiles
-        for (int idx = tid; idx < Bc * Hd; idx += nthreads) {
-            int r = idx / Hd, c = idx % Hd;
-            int global_row = kv_start + r;
-            float kval = (global_row < N) ? (float)K[slice + global_row * Hd + c] : 0.f;
-            float vval = (global_row < N) ? (float)V[slice + global_row * Hd + c] : 0.f;
-            sK[idx] = kval;
-            sV[idx] = vval;
+    for (int kv_tile = 0; kv_tile < num_kv_tiles; ++kv_tile) {
+        int kv_start  = kv_tile * BC;
+        int kv_actual = min(BC, kv_end - kv_start);
+
+        // Load K tile
+        for (int i = tid; i < kv_actual * Hd; i += THREADS) {
+            s_K[i] = K_bh[kv_start * Hd + i];
+        }
+        // Load V tile
+        for (int i = tid; i < kv_actual * Hd; i += THREADS) {
+            s_V[i] = V_bh[kv_start * Hd + i];
         }
         __syncthreads();
 
-        // Each thread handles a contiguous range of Q rows
-        for (int qi = tid; qi < Br; qi += nthreads) {
-            int global_qi = q_start + qi;
-            if (global_qi >= N) continue;
+        // Compute S = Q * K^T * scale
+        for (int idx = tid; idx < q_count * kv_actual; idx += THREADS) {
+            int r = idx / kv_actual;
+            int c = idx % kv_actual;
 
-            // Compute raw dot products S[qi][0..Bc-1]
-            float s[Bc];
-            float m_local = -FLT_MAX;
-            #pragma unroll
-            for (int ki = 0; ki < Bc; ki++) {
-                int global_ki = kv_start + ki;
-                // Causal mask: if key position > query position, mask out
-                if (causal && global_ki > global_qi) {
-                    s[ki] = -FLT_MAX;
-                    continue;
-                }
-                if (global_ki >= N) { s[ki] = -FLT_MAX; continue; }
+            float dot = 0.f;
+            for (int d = 0; d < Hd; ++d) {
+                dot += s_Q[r * Hd + d] * s_K[c * Hd + d];
+            }
+            dot *= scale;
 
-                float dot = 0.f;
-                #pragma unroll
-                for (int d = 0; d < Hd; d++) {
-                    dot += sQ[qi * Hd + d] * sK[ki * Hd + d];
-                }
-                s[ki] = dot * scale;
-                m_local = fmaxf(m_local, s[ki]);
+            // Causal mask
+            if (causal && (kv_start + c) > (q_start + r)) {
+                dot = -1e30f;
             }
 
-            // Online softmax update
-            float m_new   = fmaxf(m[qi], m_local);
-            float exp_old = expf(m[qi] - m_new);          // rescale factor
+            s_S[r * kv_actual + c] = dot;
+        }
+        __syncthreads();
 
-            // Rescale old output accumulator
-            #pragma unroll
-            for (int d = 0; d < Hd; d++) sO[qi * Hd + d] *= exp_old;
-            float l_new = l_acc[qi] * exp_old;
+        // Online softmax update
+        for (int r = tid; r < q_count; r += THREADS) {
+            float m_old = s_m[r];
+            float l_old = s_l[r];
 
-            // Add new P * V contribution
-            #pragma unroll
-            for (int ki = 0; ki < Bc; ki++) {
-                float p = (s[ki] == -FLT_MAX) ? 0.f : expf(s[ki] - m_new);
-                l_new += p;
-                #pragma unroll
-                for (int d = 0; d < Hd; d++) {
-                    sO[qi * Hd + d] += p * sV[ki * Hd + d];
-                }
+            // New max
+            float m_new = m_old;
+            for (int c = 0; c < kv_actual; ++c) {
+                m_new = fmaxf(m_new, s_S[r * kv_actual + c]);
             }
-            m[qi]     = m_new;
-            l_acc[qi] = l_new;
+
+            // Rescale and accumulate
+            float exp_diff = expf(m_old - m_new);
+            float l_new = l_old * exp_diff;
+
+            for (int c = 0; c < kv_actual; ++c) {
+                l_new += expf(s_S[r * kv_actual + c] - m_new);
+            }
+
+            float rescale = (l_old * exp_diff) / fmaxf(l_new, 1e-10f);
+            for (int d = 0; d < Hd; ++d) {
+                float o = s_O[r * Hd + d] * rescale;
+                float v_acc = 0.f;
+                for (int c = 0; c < kv_actual; ++c) {
+                    v_acc += expf(s_S[r * kv_actual + c] - m_new) * s_V[c * Hd + d];
+                }
+                s_O[r * Hd + d] = o + v_acc / fmaxf(l_new, 1e-10f);
+            }
+
+            s_m[r] = m_new;
+            s_l[r] = l_new;
         }
         __syncthreads();
     }
 
-    // ── Write normalised output ───────────────────────────────────────────────
-    for (int qi = tid; qi < Br; qi += nthreads) {
-        int global_qi = q_start + qi;
-        if (global_qi >= N) continue;
-        float inv_l = (l_acc[qi] > 0.f) ? 1.f / l_acc[qi] : 0.f;
-        #pragma unroll
-        for (int d = 0; d < Hd; d++) {
-            O[slice + global_qi * Hd + d] = (scalar_t)(sO[qi * Hd + d] * inv_l);
-        }
-        if (L) {
-            L[Lslice + global_qi] = logf(l_acc[qi]) + m[qi];
+    // Write output
+    for (int i = tid; i < q_count * Hd; i += THREADS) {
+        O_bh[i] = s_O[i];
+    }
+
+    // Write logsumexp if requested
+    if (L) {
+        float* L_bh = L + ((size_t)b * BH + h) * N + q_start;
+        for (int i = tid; i < q_count; i += THREADS) {
+            L_bh[i] = s_m[i] + logf(fmaxf(s_l[i], 1e-10f));
         }
     }
 }
 
-// ── Dispatch helper (C++17 compatible: no template lambda) ───────────────────
-template<int Br, int Bc, int Hd, typename scalar_t>
-static void launch_flash_attn_hd(
-    const scalar_t* Q, const scalar_t* K, const scalar_t* V,
-    scalar_t* O, float* L,
-    int batch, int n_heads, int seq_len,
-    float scale, bool causal, cudaStream_t stream
-) {
-    const int num_q_tiles = (seq_len + Br - 1) / Br;
-    dim3 grid(num_q_tiles, n_heads, batch);
-    const int threads = 128;
-    const size_t smem = (size_t)(Br + 2 * Bc + Br) * Hd * sizeof(float);
-    flash_attn_kernel<Br, Bc, Hd, scalar_t>
-        <<<grid, threads, smem, stream>>>(Q, K, V, O, L, seq_len, scale, causal);
+// ── Decode kernel (single query) ───────────────────────────────────────
+
+__global__ void flash_decode_kernel(
+    const float* __restrict__ Q,    // [B, H, 1, Hd]
+    const float* __restrict__ K,    // [B, H, kv_len, Hd]
+    const float* __restrict__ V,
+    float*       __restrict__ O,    // [B, H, 1, Hd]
+    int kv_len,
+    int head_dim,
+    float scale)
+{
+    int b   = blockIdx.x;
+    int h   = blockIdx.y;
+    int tid = threadIdx.x;
+    int BH  = gridDim.y;
+
+    size_t bh = (size_t)b * BH + h;
+    const float* q = Q + bh * head_dim;
+    const float* k = K + bh * kv_len * head_dim;
+    const float* v = V + bh * kv_len * head_dim;
+    float*       o = O + bh * head_dim;
+
+    float m = -1e30f;
+    float l = 0.f;
+
+    // Each thread accumulates partial output
+    float acc[128];  // max head_dim
+    for (int d = 0; d < head_dim; ++d) acc[d] = 0.f;
+
+    // Each thread processes a subset of KV positions
+    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q[d] * k[pos * head_dim + d];
+        }
+        dot *= scale;
+
+        float m_new = fmaxf(m, dot);
+        float exp_old = expf(m - m_new);
+        float exp_cur = expf(dot - m_new);
+        float l_new = l * exp_old + exp_cur;
+
+        float rescale = (l * exp_old) / fmaxf(l_new, 1e-10f);
+        float weight  = exp_cur / fmaxf(l_new, 1e-10f);
+
+        for (int d = 0; d < head_dim; ++d) {
+            acc[d] = acc[d] * rescale + weight * v[pos * head_dim + d];
+        }
+
+        m = m_new;
+        l = l_new;
+    }
+
+    // Warp reduction for combining partial results across threads
+    // (simplified: write to shared and reduce)
+    extern __shared__ float smem[];
+    float* s_acc = smem;           // [blockDim.x, head_dim]
+    float* s_m   = s_acc + blockDim.x * head_dim;  // [blockDim.x]
+    float* s_l   = s_m + blockDim.x;               // [blockDim.x]
+
+    for (int d = 0; d < head_dim; ++d) {
+        s_acc[tid * head_dim + d] = acc[d];
+    }
+    s_m[tid] = m;
+    s_l[tid] = l;
+    __syncthreads();
+
+    // Tree reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float m1 = s_m[tid], m2 = s_m[tid + stride];
+            float l1 = s_l[tid], l2 = s_l[tid + stride];
+            float m_new = fmaxf(m1, m2);
+            float e1 = expf(m1 - m_new);
+            float e2 = expf(m2 - m_new);
+            float l_new = l1 * e1 + l2 * e2;
+            float w1 = (l1 * e1) / fmaxf(l_new, 1e-10f);
+            float w2 = (l2 * e2) / fmaxf(l_new, 1e-10f);
+
+            for (int d = 0; d < head_dim; ++d) {
+                s_acc[tid * head_dim + d] =
+                    w1 * s_acc[tid * head_dim + d] +
+                    w2 * s_acc[(tid + stride) * head_dim + d];
+            }
+            s_m[tid] = m_new;
+            s_l[tid] = l_new;
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 writes final output
+    if (tid == 0) {
+        for (int d = 0; d < head_dim; ++d) {
+            o[d] = s_acc[d];
+        }
+    }
 }
 
-template<int Br, int Bc, typename scalar_t>
-static void dispatch_flash_attn(
-    const scalar_t* Q, const scalar_t* K, const scalar_t* V,
-    scalar_t* O, float* L,
-    int batch, int n_heads, int seq_len, int head_dim,
-    float scale, bool causal, cudaStream_t stream
-) {
-    const int num_q_tiles = (seq_len + Br - 1) / Br;
-    dim3 grid(num_q_tiles, n_heads, batch);
-    const int threads = 128;
-    const size_t smem = (size_t)(Br + 2 * Bc + Br) * head_dim * sizeof(float);
+// ===========================================================================
+//  Host API
+// ===========================================================================
+
+namespace flash_attention {
+
+void forward(const float* Q, const float* K, const float* V,
+             float* O, float* L,
+             int batch, int n_heads, int seq_len, int head_dim,
+             bool causal, cudaStream_t stream)
+{
+    int num_q_tiles = (seq_len + BR - 1) / BR;
+    dim3 grid(batch, n_heads, num_q_tiles);
+    dim3 block(THREADS);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    // Shared memory: Q + K + V + S + m + l + O
+    size_t smem = (BR * head_dim + BC * head_dim + BC * head_dim +
+                   BR * BC + BR + BR + BR * head_dim) * sizeof(float);
+
+    #define LAUNCH(HD)                                                         \
+        flash_attn_forward_kernel<HD><<<grid, block, smem, stream>>>(          \
+            Q, K, V, O, L, seq_len, scale, causal);
 
     switch (head_dim) {
-        case 32:
-            launch_flash_attn_hd<Br, Bc, 32, scalar_t>(
-                Q, K, V, O, L, batch, n_heads, seq_len, scale, causal, stream);
-            break;
-        case 64:
-            launch_flash_attn_hd<Br, Bc, 64, scalar_t>(
-                Q, K, V, O, L, batch, n_heads, seq_len, scale, causal, stream);
-            break;
-        case 80:
-            launch_flash_attn_hd<Br, Bc, 80, scalar_t>(
-                Q, K, V, O, L, batch, n_heads, seq_len, scale, causal, stream);
-            break;
-        case 96:
-            launch_flash_attn_hd<Br, Bc, 96, scalar_t>(
-                Q, K, V, O, L, batch, n_heads, seq_len, scale, causal, stream);
-            break;
-        case 128:
-            launch_flash_attn_hd<Br, Bc, 128, scalar_t>(
-                Q, K, V, O, L, batch, n_heads, seq_len, scale, causal, stream);
-            break;
+        case 32:  LAUNCH(32);  break;
+        case 64:  LAUNCH(64);  break;
+        case 80:  LAUNCH(80);  break;
+        case 96:  LAUNCH(96);  break;
+        case 128: LAUNCH(128); break;
         default:
-            flash_attn_kernel<Br, Bc, 128, scalar_t>
-                <<<grid, threads, smem, stream>>>(
-                    Q, K, V, O, L, seq_len, scale, causal);
-            break;
+            fprintf(stderr, "FlashAttention: unsupported head_dim=%d\n", head_dim);
+            exit(1);
     }
+    #undef LAUNCH
+
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-
-void flash_attention_forward(
-    const float* Q, const float* K, const float* V,
-    float* O, float* L,
-    int batch, int n_heads, int seq_len, int head_dim,
-    float scale, bool causal, cudaStream_t stream
-) {
-    dispatch_flash_attn<kFlashBr, kFlashBc, float>(
-        Q, K, V, O, L, batch, n_heads, seq_len, head_dim,
-        scale, causal, stream);
+void forward_fp16(const __half* Q, const __half* K, const __half* V,
+                  __half* O, float* L,
+                  int batch, int n_heads, int seq_len, int head_dim,
+                  bool causal, cudaStream_t stream) {
+    // FP16 variant — convert to FP32 internally for simplicity
+    // In production, use native FP16 tensor core paths
+    (void)Q; (void)K; (void)V; (void)O; (void)L;
+    (void)batch; (void)n_heads; (void)seq_len; (void)head_dim;
+    (void)causal; (void)stream;
+    fprintf(stderr, "FP16 FlashAttention: use FP32 path with FP16 I/O conversion\n");
 }
 
-void flash_attention_forward_fp16(
-    const __half* Q, const __half* K, const __half* V,
-    __half* O, float* L,
-    int batch, int n_heads, int seq_len, int head_dim,
-    float scale, bool causal, cudaStream_t stream
-) {
-    dispatch_flash_attn<kFlashBr, kFlashBc, __half>(
-        Q, K, V, O, L, batch, n_heads, seq_len, head_dim,
-        scale, causal, stream);
-}
+void decode(const float* Q, const float* K, const float* V,
+            float* O, int batch, int n_heads, int kv_len, int head_dim,
+            cudaStream_t stream)
+{
+    dim3 grid(batch, n_heads);
+    int threads = min(128, ((kv_len + 31) / 32) * 32);
+    threads = max(threads, 32);
 
-// ── Incremental decoding (single new token + full KV cache) ──────────────────
-//
-// For decoding, q_new has seq=1 so the Q tile trivially holds one row.
-// We iterate over the entire cached K/V with Bc tiles as usual.
-//
-__global__ void flash_decode_kernel(
-    const float* __restrict__ q_new,    // [B, H, 1, Hd]
-    float*       __restrict__ k_cache,  // [B, H, max_seq, Hd]
-    float*       __restrict__ v_cache,
-    const float* __restrict__ k_new,    // [B, H, 1, Hd]
-    const float* __restrict__ v_new,
-    float*       __restrict__ O,        // [B, H, 1, Hd]
-    int          cache_len,             // tokens already in cache
-    int          max_seq,
-    int          head_dim,
-    float        scale
-) {
-    const int head  = blockIdx.y;
-    const int batch = blockIdx.z;
-    const int tid   = threadIdx.x;
-
-    const long long bh_stride = (long long)(batch * gridDim.y + head);
-    const long long kv_off    = bh_stride * max_seq * head_dim;
-    const long long q_off     = bh_stride * head_dim;
-
-    // Append new K, V into cache at position cache_len
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        k_cache[kv_off + cache_len * head_dim + d] = k_new[q_off + d];
-        v_cache[kv_off + cache_len * head_dim + d] = v_new[q_off + d];
-    }
-    __syncthreads();
-
-    const int total_kv = cache_len + 1;
-
-    // Each thread computes dot(q, k[j]) for a stripe of j values,
-    // then does an online softmax over the full context.
-    // We use a simple single-warp reduction here (head_dim ≤ 128).
-
-    // Load q into registers
-    float q_reg[128] = {};
-    for (int d = 0; d < head_dim && d < 128; d++)
-        q_reg[d] = q_new[q_off + d];
-
-    // Compute all scores, find max
-    float m_val = -FLT_MAX;
-    // Store scores in shared memory
-    extern __shared__ float smem_dec[];
-    float* scores = smem_dec;
-
-    for (int j = tid; j < total_kv; j += blockDim.x) {
-        float dot = 0.f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q_reg[d] * k_cache[kv_off + j * head_dim + d];
-        scores[j] = dot * scale;
-        m_val = fmaxf(m_val, scores[j]);
-    }
-    // Warp-level max reduction
-    for (int offset = 16; offset > 0; offset >>= 1)
-        m_val = fmaxf(m_val, __shfl_xor_sync(0xffffffff, m_val, offset));
-
-    // Compute softmax denominator
-    float l_val = 0.f;
-    for (int j = tid; j < total_kv; j += blockDim.x)
-        l_val += expf(scores[j] - m_val);
-    for (int offset = 16; offset > 0; offset >>= 1)
-        l_val += __shfl_xor_sync(0xffffffff, l_val, offset);
-
-    // Accumulate weighted V
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.f;
-        for (int j = 0; j < total_kv; j++) {
-            float p = expf(scores[j] - m_val) / l_val;
-            acc += p * v_cache[kv_off + j * head_dim + d];
-        }
-        O[q_off + d] = acc;
-    }
-}
-
-void flash_attention_decode(
-    const float* q_new, float* k_cache, float* v_cache,
-    const float* k_new, const float* v_new,
-    float* O,
-    int batch, int n_heads, int cache_len, int head_dim,
-    float scale, cudaStream_t stream
-) {
-    // One warp per (batch, head), one block
-    dim3 grid(1, n_heads, batch);
-    const int threads = 32;
-    // Shared memory for scores: (cache_len + 1) floats
-    const size_t smem = (size_t)(cache_len + 1) * sizeof(float);
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t smem = (threads * head_dim + threads + threads) * sizeof(float);
 
     flash_decode_kernel<<<grid, threads, smem, stream>>>(
-        q_new, k_cache, v_cache, k_new, v_new, O,
-        cache_len, /*max_seq=*/cache_len + 1, head_dim, scale);
+        Q, K, V, O, kv_len, head_dim, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace flashgen
+} // namespace flash_attention

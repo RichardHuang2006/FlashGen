@@ -1,193 +1,129 @@
 #pragma once
+
+#include "model_config.hpp"
+#include "request.hpp"
+#include "block_allocator.hpp"
+#include "paged_kv_cache.cuh"
+#include "prefix_cache.hpp"
+#include "scheduler.hpp"
+#include "transformer.hpp"
+
 #include <atomic>
 #include <condition_variable>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <string>
 #include <thread>
-#include <vector>
-#include "model_config.hpp"
-#include "cuda_utils.cuh"
+#include <string>
 
-namespace flashgen {
-
-// ── Request / response types ─────────────────────────────────────────────────
-struct InferenceRequest {
-    int                      id;             // caller-assigned request ID
-    std::vector<int>         prompt_ids;     // tokenized prompt
-    InferenceConfig          cfg;            // per-request config
-    std::function<void(const std::string&)> callback; // called when done
-};
-
-struct InferenceResponse {
-    int              request_id;
-    std::string      generated_text;
-    std::vector<int> generated_ids;
-    float            latency_ms;    // end-to-end wall time
-    float            tpot_ms;       // time per output token
-    bool             success;
-    std::string      error;
-};
-
-// ── Bounded lock-free-like SPSC slot for pipeline stages ────────────────────
-template<typename T, int N>
-class BoundedQueue {
-    static_assert((N & (N - 1)) == 0, "N must be power of 2");
-public:
-    BoundedQueue() : head_(0), tail_(0) {}
-
-    bool push(T item) {
-        size_t h = head_.load(std::memory_order_relaxed);
-        size_t next = (h + 1) & mask_;
-        if (next == tail_.load(std::memory_order_acquire)) return false; // full
-        slots_[h] = std::move(item);
-        head_.store(next, std::memory_order_release);
-        return true;
-    }
-
-    bool pop(T& item) {
-        size_t t = tail_.load(std::memory_order_relaxed);
-        if (t == head_.load(std::memory_order_acquire)) return false; // empty
-        item = std::move(slots_[t]);
-        tail_.store((t + 1) & mask_, std::memory_order_release);
-        return true;
-    }
-
-    bool empty() const {
-        return tail_.load(std::memory_order_acquire) ==
-               head_.load(std::memory_order_acquire);
-    }
-
-private:
-    static constexpr size_t mask_ = N - 1;
-    T                       slots_[N];
-    std::atomic<size_t>     head_;
-    std::atomic<size_t>     tail_;
-};
-
-// ── Stage 1: preprocessing (CPU) ─────────────────────────────────────────────
-// Tokenization → embedding lookup (host side) → H2D transfer to pinned buf
-struct PreprocessedBatch {
-    std::shared_ptr<InferenceRequest> request;
-    PinnedBuffer<int>                 ids;
-    int                               seq_len;
-    CudaEvent                         h2d_done;
-
-    PreprocessedBatch(std::shared_ptr<InferenceRequest> req, int seq)
-        : request(std::move(req)), ids(seq), seq_len(seq) {}
-};
-
-// ── Stage 2: GPU compute ──────────────────────────────────────────────────────
-struct ComputedBatch {
-    std::shared_ptr<InferenceRequest> request;
-    PinnedBuffer<float>               logits;  // [vocab_size] per request step
-    int                               vocab_size;
-    int                               steps_done;
-    CudaEvent                         compute_done;
-
-    ComputedBatch(std::shared_ptr<InferenceRequest> req, int vsz, int steps)
-        : request(std::move(req)), logits(vsz), vocab_size(vsz),
-          steps_done(steps) {}
-};
-
-// ── Async three-stage pipeline ────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+//  Inference engine — production-grade serving pipeline
 //
-// Stage 1 (CPU thread): tokenize, pin memory, H2D transfer
-// Stage 2 (GPU thread): run transformer forward pass (streaming)
-// Stage 3 (CPU thread): D2H transfer, decode tokens, invoke callback
+//  Integrates all components:
+//    Transformer (model execution)
+//    BlockAllocator (GPU memory management)
+//    PagedKVCache (block-table-based KV storage)
+//    PrefixCache (radix-tree prefix sharing)
+//    Scheduler (continuous batching)
 //
-// The pipeline is started once at construction and runs until shutdown().
-class AsyncPipeline {
+//  The engine runs a main loop that:
+//    1. Calls scheduler to form the next batch
+//    2. Executes prefill / decode forward passes
+//    3. Samples next tokens
+//    4. Updates sequence state and delivers responses
+// ---------------------------------------------------------------------------
+
+struct EngineStats {
+    std::atomic<int64_t> requests_completed{0};
+    std::atomic<int64_t> tokens_generated{0};
+    std::atomic<int64_t> prefill_tokens{0};
+    std::atomic<double>  total_latency_ms{0.0};
+    std::atomic<int64_t> iterations{0};
+
+    double avg_latency_ms() const {
+        int64_t n = requests_completed.load();
+        return n > 0 ? total_latency_ms.load() / n : 0.0;
+    }
+    double throughput_tps() const {
+        double t = total_latency_ms.load();
+        return t > 0.0 ? tokens_generated.load() / (t / 1000.0) : 0.0;
+    }
+};
+
+class InferenceEngine {
 public:
-    explicit AsyncPipeline(
-        std::shared_ptr<class Transformer> model,
-        int queue_depth = 8
-    );
-    ~AsyncPipeline();
+    explicit InferenceEngine(const EngineConfig& config);
+    ~InferenceEngine();
 
-    // Non-blocking: enqueue request, callback called on completion
-    // Returns false if the input queue is full
-    bool submit(InferenceRequest req);
+    InferenceEngine(const InferenceEngine&) = delete;
+    InferenceEngine& operator=(const InferenceEngine&) = delete;
 
-    // Blocking: submit + wait for response
-    InferenceResponse run_sync(InferenceRequest req);
+    // ── Lifecycle ───────────────────────────────────────────────────────
 
-    // Drain all in-flight requests and stop worker threads gracefully
+    /// Start the engine loop (background thread).
+    void start();
+
+    /// Graceful shutdown: finish in-flight requests, then stop.
     void shutdown();
 
-    // Statistics
-    struct Stats {
-        std::atomic<uint64_t> requests_completed{0};
-        std::atomic<uint64_t> total_tokens_generated{0};
-        std::atomic<double>   total_latency_ms{0.0};
-    };
-    const Stats& stats() const { return stats_; }
+    bool is_running() const { return running_.load(); }
+
+    // ── Request submission ──────────────────────────────────────────────
+
+    /// Async: submit a request with callback. Returns request ID.
+    int submit(InferenceRequest req);
+
+    /// Sync: submit and block until response is ready.
+    InferenceResponse generate(InferenceRequest req);
+
+    // ── Stats ───────────────────────────────────────────────────────────
+
+    const EngineStats& stats() const { return stats_; }
+
+    // ── Benchmarking ────────────────────────────────────────────────────
+
+    /// Run a benchmark: prefill throughput (tokens/sec).
+    void benchmark_prefill(int seq_len, int batch_size, int num_runs);
+
+    /// Run a benchmark: decode throughput (tokens/sec).
+    void benchmark_decode(int num_seqs, int context_len, int decode_steps);
 
 private:
-    std::shared_ptr<Transformer> model_;
-    Stats                        stats_;
-    std::atomic<bool>            running_{true};
+    EngineConfig config_;
 
-    // Inter-stage queues  (power-of-two capacities)
-    static constexpr int kQueueSize = 16;
-    std::queue<std::shared_ptr<InferenceRequest>> input_queue_;
-    std::mutex  input_mutex_;
-    std::condition_variable input_cv_;
+    // Core components
+    std::unique_ptr<Transformer>    model_;
+    std::unique_ptr<BlockAllocator> allocator_;
+    std::unique_ptr<PagedKVCache>   kv_cache_;
+    std::unique_ptr<PrefixCache>    prefix_cache_;
+    std::unique_ptr<Scheduler>      scheduler_;
 
-    std::queue<std::shared_ptr<PreprocessedBatch>> preproc_queue_;
-    std::mutex  preproc_mutex_;
-    std::condition_variable preproc_cv_;
+    // Engine thread
+    std::thread         engine_thread_;
+    std::atomic<bool>   running_{false};
+    std::atomic<bool>   shutdown_requested_{false};
 
-    std::queue<std::shared_ptr<ComputedBatch>> postproc_queue_;
-    std::mutex  postproc_mutex_;
-    std::condition_variable postproc_cv_;
+    // Request queue (thread-safe ingestion)
+    std::queue<std::shared_ptr<SequenceGroup>> incoming_;
+    std::mutex              incoming_mu_;
+    std::condition_variable incoming_cv_;
+    std::atomic<int>        next_request_id_{0};
 
-    // Worker threads
-    std::thread preproc_thread_;
-    std::thread compute_thread_;
-    std::thread postproc_thread_;
+    // GPU resources
+    CudaStream   compute_stream_;
+    CudaStream   copy_stream_;
+    DeviceBuffer<float> logits_buf_;
 
-    // Dedicated CUDA streams per stage
-    CudaStream h2d_stream_;
-    CudaStream compute_stream_;
-    CudaStream d2h_stream_;
+    // Stats
+    EngineStats stats_;
 
-    // Worker implementations
-    void preproc_worker();
-    void compute_worker();
-    void postproc_worker();
+    // ── Internal ────────────────────────────────────────────────────────
 
-    // Tokenizer (simple BPE stub — replace with tiktoken binding)
-    std::vector<int> tokenize(const std::string& text) const;
-    std::string      detokenize(const std::vector<int>& ids) const;
-
-    // Sampling
-    int sample_next_token(
-        const float* logits, int vocab_size,
-        float temperature, float top_p, bool greedy
-    );
+    void engine_loop();
+    void step();
+    void drain_incoming();
+    void sample_tokens(const float* logits, int num_seqs,
+                       const std::vector<SequenceGroup*>& batch,
+                       std::vector<int>& out_tokens);
+    void deliver_responses(const std::vector<SequenceGroup*>& finished);
 };
-
-// ── Simple benchmark harness ─────────────────────────────────────────────────
-struct BenchmarkResult {
-    int    seq_len;
-    int    batch_size;
-    int    num_runs;
-    float  mean_latency_ms;
-    float  p50_latency_ms;
-    float  p95_latency_ms;
-    float  p99_latency_ms;
-    float  throughput_tokens_per_sec;
-};
-
-BenchmarkResult benchmark(
-    Transformer&    model,
-    int             seq_len,
-    int             batch_size,
-    int             num_runs,
-    bool            warmup = true
-);
-
-} // namespace flashgen

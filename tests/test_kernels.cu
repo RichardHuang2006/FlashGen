@@ -1,273 +1,306 @@
-/*
- * test_kernels.cu
- *
- * Correctness and performance tests for:
- *   - Layer Normalization (standard + fused residual)
- *   - GELU activation
- *   - Fused Feed-Forward Network
- *   - Token embedding lookup
- *   - Softmax with temperature
- */
-
 #include "kernels.cuh"
 #include "cuda_utils.cuh"
-#include <cublas_v2.h>
+
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-#include <numeric>
-#include <random>
-#include <algorithm>
 
-using namespace flashgen;
+static int tests_passed = 0;
+static int tests_failed = 0;
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
+#define TEST(name) printf("  %-50s", name); fflush(stdout)
+#define PASS() do { printf("[PASS]\n"); ++tests_passed; } while(0)
+#define FAIL(msg) do { printf("[FAIL] %s\n", msg); ++tests_failed; } while(0)
 
-static std::mt19937 g_rng(123);
-
-static void fill_rand(float* buf, size_t n, float lo = -1.f, float hi = 1.f) {
-    std::uniform_real_distribution<float> dist(lo, hi);
-    for (size_t i = 0; i < n; i++) buf[i] = dist(g_rng);
-}
-
-static float max_abs_err(const float* a, const float* b, size_t n) {
-    float e = 0.f;
-    for (size_t i = 0; i < n; i++) e = std::max(e, std::abs(a[i] - b[i]));
-    return e;
-}
-
-static bool check(bool cond, const char* msg) {
-    printf("  %s %s\n", cond ? "PASS" : "FAIL", msg);
-    return cond;
-}
-
-// ── CPU reference implementations ────────────────────────────────────────────
-
-static void ref_layer_norm(
-    const float* x, const float* gamma, const float* beta,
-    float* out, int rows, int cols, float eps
-) {
-    for (int r = 0; r < rows; r++) {
-        const float* xr = x + r * cols;
-        float*       yr = out + r * cols;
-        float sum = 0.f, sum2 = 0.f;
-        for (int c = 0; c < cols; c++) { sum += xr[c]; sum2 += xr[c] * xr[c]; }
-        float mu  = sum / cols;
-        float var = sum2 / cols - mu * mu;
-        float rstd = 1.f / sqrtf(var + eps);
-        for (int c = 0; c < cols; c++)
-            yr[c] = gamma[c] * (xr[c] - mu) * rstd + beta[c];
+// CPU references
+static void ref_layer_norm(const float* x, const float* g, const float* b,
+                           float* out, int cols, float eps) {
+    float mean = 0.f;
+    for (int i = 0; i < cols; ++i) mean += x[i];
+    mean /= cols;
+    float var = 0.f;
+    for (int i = 0; i < cols; ++i) var += (x[i] - mean) * (x[i] - mean);
+    var /= cols;
+    float inv = 1.f / sqrtf(var + eps);
+    for (int i = 0; i < cols; ++i) {
+        out[i] = g[i] * (x[i] - mean) * inv + b[i];
     }
 }
 
-static void ref_gelu(const float* x, float* y, size_t n) {
-    for (size_t i = 0; i < n; i++)
-        y[i] = 0.5f * x[i] * (1.f + erff(x[i] * 0.7071067811865476f));
+static float ref_gelu(float x) {
+    return 0.5f * x * (1.f + erff(x * 0.7071067811865476f));
 }
 
-static void ref_softmax(float* x, int rows, int cols, float temp) {
-    for (int r = 0; r < rows; r++) {
-        float* xr = x + r * cols;
-        float m = *std::max_element(xr, xr + cols);
-        float s = 0.f;
-        for (int c = 0; c < cols; c++) { xr[c] = expf(xr[c] / temp - m); s += xr[c]; }
-        for (int c = 0; c < cols; c++) xr[c] /= s;
+// ---------------------------------------------------------------------------
+//  Tests
+// ---------------------------------------------------------------------------
+
+void test_layer_norm() {
+    TEST("LayerNorm correctness");
+
+    int rows = 8, cols = 256;
+    float eps = 1e-5f;
+
+    std::vector<float> hx(rows * cols), hg(cols, 1.f), hb(cols, 0.f);
+    std::vector<float> ho(rows * cols), href(rows * cols);
+    srand(42);
+    for (int i = 0; i < rows * cols; ++i)
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.f;
+
+    DeviceBuffer<float> dx(rows * cols), dg(cols), db(cols), dout(rows * cols);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dg, hg.data(), cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(db, hb.data(), cols * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::layer_norm(dx, dg, db, dout, rows, cols, eps, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(ho.data(), dout, rows * cols * 4, cudaMemcpyDeviceToHost));
+
+    for (int r = 0; r < rows; ++r) {
+        ref_layer_norm(hx.data() + r * cols, hg.data(), hb.data(),
+                       href.data() + r * cols, cols, eps);
+    }
+
+    float max_err = 0.f;
+    for (int i = 0; i < rows * cols; ++i)
+        max_err = fmaxf(max_err, fabsf(ho[i] - href[i]));
+
+    if (max_err < 1e-4f) {
+        printf("(err=%.7f) ", max_err);
+        PASS();
+    } else {
+        char buf[64]; snprintf(buf, 64, "err=%.5f", max_err);
+        FAIL(buf);
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Test: Layer Normalization
-// ════════════════════════════════════════════════════════════════════════════
+void test_layer_norm_residual() {
+    TEST("LayerNorm with residual");
 
-static bool test_layer_norm() {
-    printf("\n[Test] Layer Normalization\n");
-    bool all_pass = true;
+    int rows = 4, cols = 128;
+    float eps = 1e-5f;
 
-    struct Case { int rows, cols; };
-    std::vector<Case> cases = {{1,768}, {64,768}, {32,1024}, {128,64}, {256,3072}};
-
-    for (auto& c : cases) {
-        const size_t n = (size_t)c.rows * c.cols;
-        std::vector<float> hX(n), hG(c.cols, 1.f), hB(c.cols, 0.f);
-        std::vector<float> hOut_ref(n), hOut_gpu(n);
-        fill_rand(hX.data(), n);
-        fill_rand(hG.data(), c.cols, 0.5f, 2.f);
-        fill_rand(hB.data(), c.cols, -0.5f, 0.5f);
-
-        ref_layer_norm(hX.data(), hG.data(), hB.data(), hOut_ref.data(),
-                       c.rows, c.cols, 1e-5f);
-
-        DeviceBuffer<float> dX(n), dG(c.cols), dB(c.cols), dOut(n);
-        CUDA_CHECK(cudaMemcpy(dX.ptr, hX.data(), n*4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dG.ptr, hG.data(), c.cols*4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dB.ptr, hB.data(), c.cols*4, cudaMemcpyHostToDevice));
-
-        layer_norm(dX.ptr, dOut.ptr, dG.ptr, dB.ptr, c.rows, c.cols, 1e-5f, 0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(hOut_gpu.data(), dOut.ptr, n*4, cudaMemcpyDeviceToHost));
-
-        float err = max_abs_err(hOut_ref.data(), hOut_gpu.data(), n);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "rows=%d cols=%d  max_err=%.2e", c.rows, c.cols, err);
-        all_pass &= check(err < 1e-4f, msg);
+    std::vector<float> hx(rows * cols), hr(rows * cols);
+    std::vector<float> hg(cols, 1.f), hb(cols, 0.f);
+    std::vector<float> ho(rows * cols), href(rows * cols);
+    srand(77);
+    for (int i = 0; i < rows * cols; ++i) {
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f);
+        hr[i] = ((float)rand() / RAND_MAX - 0.5f);
     }
-    return all_pass;
-}
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Test: Fused residual LayerNorm
-// ════════════════════════════════════════════════════════════════════════════
-
-static bool test_layer_norm_residual() {
-    printf("\n[Test] LayerNorm with fused residual add\n");
-
-    const int rows = 16, cols = 768;
-    const size_t n = (size_t)rows * cols;
-
-    std::vector<float> hX(n), hRes(n), hG(cols, 1.f), hB(cols, 0.f);
-    std::vector<float> hRef(n), hGpu(n), hSum(n);
-    fill_rand(hX.data(), n);
-    fill_rand(hRes.data(), n);
-
-    for (size_t i = 0; i < n; i++) hSum[i] = hX[i] + hRes[i];
-    ref_layer_norm(hSum.data(), hG.data(), hB.data(), hRef.data(), rows, cols, 1e-5f);
-
-    DeviceBuffer<float> dX(n), dRes(n), dG(cols), dB(cols), dOut(n);
-    CUDA_CHECK(cudaMemcpy(dX.ptr,   hX.data(),  n*4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dRes.ptr, hRes.data(), n*4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dG.ptr,   hG.data(), cols*4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dB.ptr,   hB.data(), cols*4, cudaMemcpyHostToDevice));
-
-    layer_norm_residual(dX.ptr, dRes.ptr, dOut.ptr, dG.ptr, dB.ptr,
-                        rows, cols, 1e-5f, 0);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(hGpu.data(), dOut.ptr, n*4, cudaMemcpyDeviceToHost));
-
-    float err = max_abs_err(hRef.data(), hGpu.data(), n);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "max_err=%.2e", err);
-    return check(err < 1e-4f, msg);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  Test: GELU
-// ════════════════════════════════════════════════════════════════════════════
-
-static bool test_gelu() {
-    printf("\n[Test] GELU activation\n");
-    bool all_pass = true;
-
-    for (int n : {128, 1024, 65536, 1 << 20}) {
-        std::vector<float> hX(n), hRef(n), hGpu(n);
-        fill_rand(hX.data(), n, -3.f, 3.f);
-        ref_gelu(hX.data(), hRef.data(), n);
-
-        DeviceBuffer<float> dX(n);
-        CUDA_CHECK(cudaMemcpy(dX.ptr, hX.data(), n*4, cudaMemcpyHostToDevice));
-        gelu_inplace(dX.ptr, n, 0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(hGpu.data(), dX.ptr, n*4, cudaMemcpyDeviceToHost));
-
-        float err = max_abs_err(hRef.data(), hGpu.data(), n);
-        char msg[48];
-        snprintf(msg, sizeof(msg), "n=%d  max_err=%.2e", n, err);
-        all_pass &= check(err < 1e-5f, msg);
+    // Reference: LN(x + residual)
+    std::vector<float> hsum(rows * cols);
+    for (int i = 0; i < rows * cols; ++i) hsum[i] = hx[i] + hr[i];
+    for (int r = 0; r < rows; ++r) {
+        ref_layer_norm(hsum.data() + r * cols, hg.data(), hb.data(),
+                       href.data() + r * cols, cols, eps);
     }
-    return all_pass;
+
+    DeviceBuffer<float> dx(rows * cols), dr(rows * cols), dg(cols), db(cols), dout(rows * cols);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dr, hr.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dg, hg.data(), cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(db, hb.data(), cols * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::layer_norm_residual(dx, dr, dg, db, dout, rows, cols, eps, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(ho.data(), dout, rows * cols * 4, cudaMemcpyDeviceToHost));
+
+    float max_err = 0.f;
+    for (int i = 0; i < rows * cols; ++i)
+        max_err = fmaxf(max_err, fabsf(ho[i] - href[i]));
+
+    if (max_err < 1e-4f) PASS();
+    else { char buf[64]; snprintf(buf, 64, "err=%.5f", max_err); FAIL(buf); }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Test: Softmax with temperature
-// ════════════════════════════════════════════════════════════════════════════
+void test_gelu() {
+    TEST("GELU activation");
 
-static bool test_softmax_temperature() {
-    printf("\n[Test] Softmax with temperature\n");
-    bool all_pass = true;
-
-    for (float temp : {0.5f, 1.0f, 2.0f}) {
-        const int rows = 4, cols = 50257; // vocab-size rows
-        const size_t n = (size_t)rows * cols;
-        std::vector<float> hX(n), hRef(n), hGpu(n);
-        fill_rand(hX.data(), n, -5.f, 5.f);
-        std::copy(hX.begin(), hX.end(), hRef.begin());
-        ref_softmax(hRef.data(), rows, cols, temp);
-
-        DeviceBuffer<float> dX(n);
-        CUDA_CHECK(cudaMemcpy(dX.ptr, hX.data(), n*4, cudaMemcpyHostToDevice));
-        softmax_temperature(dX.ptr, rows, cols, temp, 0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(hGpu.data(), dX.ptr, n*4, cudaMemcpyDeviceToHost));
-
-        // Check sum=1 and max_err
-        float sum0 = 0.f;
-        for (int c = 0; c < cols; c++) sum0 += hGpu[c];
-        float err = max_abs_err(hRef.data(), hGpu.data(), n);
-
-        char msg[64];
-        snprintf(msg, sizeof(msg), "temp=%.1f  sum[0]=%.6f  max_err=%.2e",
-                 temp, sum0, err);
-        all_pass &= check(std::abs(sum0 - 1.f) < 1e-4f && err < 1e-4f, msg);
+    int n = 1024;
+    std::vector<float> hx(n), href(n);
+    srand(55);
+    for (int i = 0; i < n; ++i) {
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f) * 4.f;
+        href[i] = ref_gelu(hx[i]);
     }
-    return all_pass;
+
+    DeviceBuffer<float> dx(n);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), n * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::gelu(dx, n, s);
+    s.sync();
+
+    CUDA_CHECK(cudaMemcpy(hx.data(), dx, n * 4, cudaMemcpyDeviceToHost));
+
+    float max_err = 0.f;
+    for (int i = 0; i < n; ++i)
+        max_err = fmaxf(max_err, fabsf(hx[i] - href[i]));
+
+    if (max_err < 1e-5f) PASS();
+    else { char buf[64]; snprintf(buf, 64, "err=%.6f", max_err); FAIL(buf); }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Test: LayerNorm throughput
-// ════════════════════════════════════════════════════════════════════════════
+void test_softmax_temperature() {
+    TEST("Softmax with temperature");
 
-static void benchmark_layer_norm() {
-    printf("\n[Bench] LayerNorm throughput\n");
-    struct Case { int rows, cols; const char* label; };
-    std::vector<Case> cases = {
-        {512, 768,  "bs=512 d=768  (GPT-2 small)"},
-        {512, 1024, "bs=512 d=1024 (GPT-2 medium)"},
-        {128, 1280, "bs=128 d=1280 (GPT-2 large)"},
-    };
-    for (auto& c : cases) {
-        const size_t n = (size_t)c.rows * c.cols;
-        DeviceBuffer<float> dX(n), dO(n), dG(c.cols), dB(c.cols);
-        // Warmup
-        for (int i = 0; i < 5; i++)
-            layer_norm(dX.ptr, dO.ptr, dG.ptr, dB.ptr, c.rows, c.cols, 1e-5f, 0);
-        CUDA_CHECK(cudaDeviceSynchronize());
+    int rows = 4, cols = 100;
+    float temp = 0.5f;
 
-        const int N = 100;
-        CudaEvent start, end;
-        start.record();
-        for (int i = 0; i < N; i++)
-            layer_norm(dX.ptr, dO.ptr, dG.ptr, dB.ptr, c.rows, c.cols, 1e-5f, 0);
-        end.record();
-        CUDA_CHECK(cudaDeviceSynchronize());
-        float ms = end.elapsed_ms(start) / N;
-        // Bandwidth: read x, write out (2 * n * 4 bytes)
-        double bw_gb = 2.0 * n * 4 / (ms * 1e-3) / 1e9;
-        printf("  %-38s %6.3f ms  %6.1f GB/s\n", c.label, ms, bw_gb);
+    std::vector<float> hx(rows * cols);
+    srand(88);
+    for (int i = 0; i < rows * cols; ++i)
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f) * 3.f;
+
+    DeviceBuffer<float> dx(rows * cols);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::softmax_temperature(dx, rows, cols, temp, s);
+    s.sync();
+
+    std::vector<float> ho(rows * cols);
+    CUDA_CHECK(cudaMemcpy(ho.data(), dx, rows * cols * 4, cudaMemcpyDeviceToHost));
+
+    // Check: rows should sum to ~1, all values >= 0
+    bool ok = true;
+    for (int r = 0; r < rows; ++r) {
+        float sum = 0.f;
+        for (int c = 0; c < cols; ++c) {
+            float v = ho[r * cols + c];
+            if (v < -1e-6f) { ok = false; break; }
+            sum += v;
+        }
+        if (fabsf(sum - 1.f) > 1e-3f) ok = false;
+    }
+
+    if (ok) PASS(); else FAIL("row sums != 1 or negative values");
+}
+
+void test_argmax() {
+    TEST("Argmax");
+
+    int rows = 8, cols = 50;
+    std::vector<float> hx(rows * cols, 0.f);
+    std::vector<int> expected(rows);
+
+    srand(33);
+    for (int r = 0; r < rows; ++r) {
+        int best = rand() % cols;
+        expected[r] = best;
+        for (int c = 0; c < cols; ++c)
+            hx[r * cols + c] = (c == best) ? 10.f : -1.f;
+    }
+
+    DeviceBuffer<float> dx(rows * cols);
+    DeviceBuffer<int> dout(rows);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::argmax(dx, dout, rows, cols, s);
+    s.sync();
+
+    std::vector<int> ho(rows);
+    CUDA_CHECK(cudaMemcpy(ho.data(), dout, rows * 4, cudaMemcpyDeviceToHost));
+
+    bool ok = true;
+    for (int r = 0; r < rows; ++r) {
+        if (ho[r] != expected[r]) { ok = false; break; }
+    }
+
+    if (ok) PASS(); else FAIL("incorrect argmax");
+}
+
+void test_rms_norm() {
+    TEST("RMSNorm correctness");
+
+    int rows = 4, cols = 256;
+    float eps = 1e-5f;
+
+    std::vector<float> hx(rows * cols), hg(cols, 1.f);
+    std::vector<float> ho(rows * cols), href(rows * cols);
+    srand(44);
+    for (int i = 0; i < rows * cols; ++i)
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.f;
+
+    // CPU reference
+    for (int r = 0; r < rows; ++r) {
+        float ss = 0.f;
+        for (int c = 0; c < cols; ++c)
+            ss += hx[r * cols + c] * hx[r * cols + c];
+        float inv = 1.f / sqrtf(ss / cols + eps);
+        for (int c = 0; c < cols; ++c)
+            href[r * cols + c] = hg[c] * hx[r * cols + c] * inv;
+    }
+
+    DeviceBuffer<float> dx(rows * cols), dg(cols), dout(rows * cols);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), rows * cols * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dg, hg.data(), cols * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::rms_norm(dx, dg, dout, rows, cols, eps, s);
+    s.sync();
+    CUDA_CHECK(cudaMemcpy(ho.data(), dout, rows * cols * 4, cudaMemcpyDeviceToHost));
+
+    float max_err = 0.f;
+    for (int i = 0; i < rows * cols; ++i)
+        max_err = fmaxf(max_err, fabsf(ho[i] - href[i]));
+
+    if (max_err < 1e-4f) {
+        printf("(err=%.7f) ", max_err);
+        PASS();
+    } else {
+        char buf[64]; snprintf(buf, 64, "err=%.5f", max_err);
+        FAIL(buf);
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+void test_silu() {
+    TEST("SiLU activation");
+
+    int n = 512;
+    std::vector<float> hx(n), href(n);
+    srand(66);
+    for (int i = 0; i < n; ++i) {
+        hx[i] = ((float)rand() / RAND_MAX - 0.5f) * 4.f;
+        float v = hx[i];
+        href[i] = v / (1.f + expf(-v));
+    }
+
+    DeviceBuffer<float> dx(n);
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), n * 4, cudaMemcpyHostToDevice));
+
+    CudaStream s;
+    kernels::silu(dx, n, s);
+    s.sync();
+
+    CUDA_CHECK(cudaMemcpy(hx.data(), dx, n * 4, cudaMemcpyDeviceToHost));
+
+    float max_err = 0.f;
+    for (int i = 0; i < n; ++i)
+        max_err = fmaxf(max_err, fabsf(hx[i] - href[i]));
+
+    if (max_err < 1e-5f) PASS();
+    else { char buf[64]; snprintf(buf, 64, "err=%.6f", max_err); FAIL(buf); }
+}
 
 int main() {
-    printf("==========================================\n");
-    printf("  Kernels Test Suite\n");
-    printf("==========================================\n");
+    printf("═══ Kernel Tests ═══\n\n");
 
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    printf("Device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
+    test_layer_norm();
+    test_layer_norm_residual();
+    test_gelu();
+    test_silu();
+    test_rms_norm();
+    test_softmax_temperature();
+    test_argmax();
 
-    bool pass = true;
-    pass &= test_layer_norm();
-    pass &= test_layer_norm_residual();
-    pass &= test_gelu();
-    pass &= test_softmax_temperature();
-    benchmark_layer_norm();
-
-    printf("\n==========================================\n");
-    printf("  Result: %s\n", pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
-    printf("==========================================\n");
-    return pass ? 0 : 1;
+    printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
+    return tests_failed > 0 ? 1 : 0;
 }

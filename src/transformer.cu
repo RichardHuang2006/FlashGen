@@ -1,485 +1,372 @@
-/*
- * transformer.cu
- *
- * Transformer layer and full GPT-2 model implementation.
- * Each TransformerLayer owns its weight buffers and activation scratch space.
- * The Transformer class orchestrates N layers plus embeddings and LM head.
- */
-
 #include "transformer.hpp"
 #include "flash_attention.cuh"
 #include "kernels.cuh"
-#include "cuda_utils.cuh"
-#include <cublas_v2.h>
+#include "paged_kv_cache.cuh"
+
+#include <algorithm>
+#include <cassert>
+#include <cstdio>
 #include <cstring>
-#include <fstream>
-#include <stdexcept>
+#include <numeric>
 
-namespace flashgen {
+// ===========================================================================
+//  ForwardBuffers — pre-allocated scratch memory
+// ===========================================================================
 
-// ── File-scope CUDA kernels (__global__ cannot be member or local) ───────────
-__global__ void add_residual_kernel(const float* a, const float* b, float* c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
+void ForwardBuffers::allocate(const ModelConfig& cfg, int max_tokens, int max_seqs) {
+    int d = cfg.d_model;
+    int kv_dim = cfg.actual_kv_heads() * cfg.head_dim();
+
+    hidden.allocate((size_t)max_tokens * d);
+    residual.allocate((size_t)max_tokens * d);
+    norm_out.allocate((size_t)max_tokens * d);
+    // Q: d_model, K: kv_dim, V: kv_dim
+    qkv.allocate((size_t)max_tokens * (d + 2 * kv_dim));
+    attn_out.allocate((size_t)max_tokens * d);
+    ffn_workspace.allocate((size_t)max_tokens * cfg.d_ff);
+    logits.allocate((size_t)max_seqs * cfg.vocab_size);
+    positions.allocate(max_tokens);
+    token_ids.allocate(max_tokens);
+    query_start_locs.allocate(max_seqs + 1);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  LayerWeights
-// ════════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+//  Transformer
+// ===========================================================================
 
-void LayerWeights::allocate(const ModelConfig& cfg) {
-    const int D  = cfg.d_model;
-    const int F  = cfg.d_ff;
-
-    ln1_gamma.resize(D);  ln1_beta.resize(D);
-    Wq.resize(D * D);     bq.resize(D);
-    Wk.resize(D * D);     bk.resize(D);
-    Wv.resize(D * D);     bv.resize(D);
-    Wo.resize(D * D);     bo.resize(D);
-    ln2_gamma.resize(D);  ln2_beta.resize(D);
-    W1.resize(F * D);     b1.resize(F);
-    W2.resize(D * F);     b2.resize(D);
-}
-
-void LayerWeights::load_from_host(
-    const float* data, const ModelConfig& cfg, cudaStream_t stream
-) {
-    const int D = cfg.d_model, F = cfg.d_ff;
-    size_t offset = 0;
-    auto copy = [&](DeviceBuffer<float>& buf, size_t n) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            buf.ptr, data + offset, n * sizeof(float),
-            cudaMemcpyHostToDevice, stream));
-        offset += n;
-    };
-    copy(ln1_gamma, D); copy(ln1_beta, D);
-    copy(Wq, D*D);      copy(bq, D);
-    copy(Wk, D*D);      copy(bk, D);
-    copy(Wv, D*D);      copy(bv, D);
-    copy(Wo, D*D);      copy(bo, D);
-    copy(ln2_gamma, D); copy(ln2_beta, D);
-    copy(W1, F*D);      copy(b1, F);
-    copy(W2, D*F);      copy(b2, D);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  KVCache
-// ════════════════════════════════════════════════════════════════════════════
-
-void KVCache::allocate(int batch, int n_heads, int max_seq_len, int head_dim) {
-    const size_t n = (size_t)batch * n_heads * max_seq_len * head_dim;
-    k.resize(n);
-    v.resize(n);
-    current_len = 0;
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  LayerActivations
-// ════════════════════════════════════════════════════════════════════════════
-
-void LayerActivations::allocate(const ModelConfig& cfg, int max_batch, int max_seq) {
-    const int T = max_batch * max_seq;
-    const int D = cfg.d_model, F = cfg.d_ff;
-    ln_out.resize(T * D);
-    qkv.resize(T * 3 * D);
-    attn_out.resize(T * D);
-    proj_out.resize(T * D);
-    ffn_hidden.resize(T * F);
-    ffn_out.resize(T * D);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  TransformerLayer
-// ════════════════════════════════════════════════════════════════════════════
-
-TransformerLayer::TransformerLayer(
-    const ModelConfig& cfg, int layer_idx, cublasHandle_t cublas, int max_batch
-) : cfg_(cfg), layer_idx_(layer_idx), cublas_(cublas) {
-    weights_.allocate(cfg);
-    acts_.allocate(cfg, max_batch, /*max_seq=*/cfg.max_seq_len);
-}
-
-// ── QKV projection ─────────────────────────────────────────────────────────
-//
-// Computes [Q; K; V] = x · [Wq; Wk; Wv]ᵀ  via three separate GEMMs.
-// Stores packed as qkv[t][0..D-1]=Q, [D..2D-1]=K, [2D..3D-1]=V.
-//
-void TransformerLayer::project_qkv(
-    const float* x, float* qkv,
-    int batch, int seq, cudaStream_t stream
-) {
-    const int D = cfg_.d_model;
-    const int T = batch * seq;
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSetStream(cublas_, stream));
-
-    // Q = x @ Wq^T
-    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-        D, T, D, &alpha,
-        weights_.Wq.ptr, D, x, D, &beta,
-        qkv + 0 * T * D, D));
-
-    // K = x @ Wk^T
-    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-        D, T, D, &alpha,
-        weights_.Wk.ptr, D, x, D, &beta,
-        qkv + 1 * T * D, D));
-
-    // V = x @ Wv^T
-    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-        D, T, D, &alpha,
-        weights_.Wv.ptr, D, x, D, &beta,
-        qkv + 2 * T * D, D));
-
-    // Add biases in-place
-    // (reuse the bias_add helper via kernel invocation is in kernels.cu;
-    //  here we call the kernels.cu fused approach via a device-function call
-    //  or simply do it with a custom kernel.)
-    // For simplicity we use cublasSger trick: bias_row += b  — see bias_add below.
-}
-
-// Inlined bias-add: adds bias vector b[D] to every row of mat[T][D]
-static void add_bias_cublas(
-    float* mat, const float* b, int T, int D,
-    cublasHandle_t cublas, cudaStream_t stream
-) {
-    if (!b) return;
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    const float alpha = 1.f;
-    // Use a ones vector approach: mat += ones_T ⊗ b
-    // We allocate a temporary ones vector (or reuse scratch).
-    // For production code this would be pre-allocated; here we do it with
-    // a custom kernel call via bias_add from kernels.cu.
-    bias_add(mat, b, T, D, stream);
-}
-
-// ── Reshape utility kernel ──────────────────────────────────────────────────
-// Interleave QKV from [3][T][D] → [batch][heads][seq][head_dim]
-// (This is a strided copy; for peak perf a dedicated kernel is preferred.)
-
-// split_heads is a no-op pointer arithmetic helper here because our packed
-// layout already separates Q, K, V into contiguous blocks.
-void TransformerLayer::split_heads(
-    const float* qkv,
-    float* Q, float* K, float* V,
-    int batch, int seq
-) {
-    const int T = batch * seq;
-    const int D = cfg_.d_model;
-    // Q is at offset 0, K at T*D, V at 2*T*D in the qkv buffer.
-    // For FlashAttention we need layout [batch, n_heads, seq, head_dim].
-    // The QKV output from project_qkv is [T, D] = [batch*seq, n_heads*head_dim].
-    // We need to reinterpret / transpose the head dimension.
-    // For now, pass pointers directly; the flash_attn kernel accepts
-    // [batch, n_heads, seq, head_dim] but if we pack batch into the seq dim
-    // we set n_heads=cfg_.n_heads, batch=1, seq=T, head_dim=cfg_.head_dim().
-    // The actual reshape is done implicitly by passing correct strides.
-    (void)qkv; (void)Q; (void)K; (void)V; (void)batch; (void)seq;
-    // Strides are handled in forward() below.
-}
-
-// ── Full-sequence forward pass ──────────────────────────────────────────────
-
-void TransformerLayer::forward(
-    const float* x_in,
-    float*       x_out,
-    int          batch,
-    int          seq_len,
-    KVCache*     kv_cache,
-    cudaStream_t stream
-) {
-    const int D    = cfg_.d_model;
-    const int F    = cfg_.d_ff;
-    const int H    = cfg_.n_heads;
-    const int Hd   = cfg_.head_dim();
-    const int T    = batch * seq_len;
-    const float eps = 1e-5f;
-
-    float* ln1_buf  = acts_.ln_out.ptr;
-    float* qkv_buf  = acts_.qkv.ptr;
-    float* attn_buf = acts_.attn_out.ptr;
-    float* proj_buf = acts_.proj_out.ptr;
-    float* ffn_buf  = acts_.ffn_hidden.ptr;
-    float* ffn_out  = acts_.ffn_out.ptr;
-
-    // ── Pre-attention layer norm ──────────────────────────────────────────
-    layer_norm(x_in, ln1_buf, weights_.ln1_gamma.ptr, weights_.ln1_beta.ptr,
-               T, D, eps, stream);
-
-    // ── QKV projection ────────────────────────────────────────────────────
-    project_qkv(ln1_buf, qkv_buf, batch, seq_len, stream);
-
-    float* Q_ptr = qkv_buf + 0 * T * D;
-    float* K_ptr = qkv_buf + 1 * T * D;
-    float* V_ptr = qkv_buf + 2 * T * D;
-
-    // ── FlashAttention  (layout: treat batch*seq as the sequence dim) ─────
-    // We present it as: batch=batch, n_heads=H, seq=seq_len, head_dim=Hd
-    // requiring Q/K/V in [batch, H, seq_len, Hd] layout.
-    // Our projection produced [T, D] = [batch*seq_len, H*Hd].
-    // A transposition (batch, seq, H, Hd) → (batch, H, seq, Hd) is needed.
-    // For simplicity we run a single-batch view (batch=1, n_heads=H,
-    // seq=T, head_dim=Hd) which is equivalent when causal=false or for a
-    // non-padded batch.  A production engine would apply the transposition.
-    const float scale = 1.f / sqrtf((float)Hd);
-    flash_attention_forward(
-        Q_ptr, K_ptr, V_ptr, attn_buf,
-        /*L=*/nullptr,
-        /*batch=*/1, H, T, Hd,
-        scale, /*causal=*/true, stream);
-
-    // ── Output projection  attn_out → proj_buf ───────────────────────────
-    CUBLAS_CHECK(cublasSetStream(cublas_, stream));
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-        D, T, D, &alpha,
-        weights_.Wo.ptr, D, attn_buf, D, &beta,
-        proj_buf, D));
-    // Bias + residual add: x_out = x_in + proj_buf
-    const int n_total = T * D;
-    add_residual_kernel<<<(n_total + 255) / 256, 256, 0, stream>>>(
-        x_in, proj_buf, x_out, n_total);
-    CUDA_CHECK(cudaGetLastError());
-
-    // ── Pre-FFN layer norm  (fused with second residual) ──────────────────
-    layer_norm(x_out, ln1_buf, weights_.ln2_gamma.ptr, weights_.ln2_beta.ptr,
-               T, D, eps, stream);
-
-    // ── FFN ───────────────────────────────────────────────────────────────
-    FFNWeights fw {
-        weights_.W1.ptr, weights_.b1.ptr,
-        weights_.W2.ptr, weights_.b2.ptr
-    };
-    fused_ffn(ln1_buf, ffn_out, ffn_buf, fw, T, D, F, cublas_, stream);
-
-    // Final residual: x_out += ffn_out
-    add_residual_kernel<<<(n_total + 255) / 256, 256, 0, stream>>>(
-        x_out, ffn_out, x_out, n_total);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Update KV cache if provided
-    if (kv_cache) kv_cache->current_len += seq_len;
-}
-
-void TransformerLayer::decode_step(
-    const float* x_in, float* x_out,
-    int batch, KVCache& kv_cache, cudaStream_t stream
-) {
-    // Single-token decode using cached KV
-    const int D  = cfg_.d_model;
-    const int H  = cfg_.n_heads;
-    const int Hd = cfg_.head_dim();
-    const int F  = cfg_.d_ff;
-    const float eps = 1e-5f;
-
-    float* ln1_buf  = acts_.ln_out.ptr;
-    float* qkv_buf  = acts_.qkv.ptr;
-    float* attn_buf = acts_.attn_out.ptr;
-    float* proj_buf = acts_.proj_out.ptr;
-    float* ffn_buf  = acts_.ffn_hidden.ptr;
-    float* ffn_out  = acts_.ffn_out.ptr;
-
-    layer_norm(x_in, ln1_buf, weights_.ln1_gamma.ptr, weights_.ln1_beta.ptr,
-               batch, D, eps, stream);
-    project_qkv(ln1_buf, qkv_buf, batch, /*seq=*/1, stream);
-
-    float* Q_ptr  = qkv_buf + 0 * batch * D;
-    float* K_ptr  = qkv_buf + 1 * batch * D;
-    float* V_ptr  = qkv_buf + 2 * batch * D;
-
-    const float scale = 1.f / sqrtf((float)Hd);
-    flash_attention_decode(
-        Q_ptr, kv_cache.k.ptr, kv_cache.v.ptr,
-        K_ptr, V_ptr,
-        attn_buf,
-        batch, H, kv_cache.current_len, Hd, scale, stream);
-
-    kv_cache.current_len++;
-
-    CUBLAS_CHECK(cublasSetStream(cublas_, stream));
-    const float alpha = 1.f, beta = 0.f;
-    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-        D, batch, D, &alpha,
-        weights_.Wo.ptr, D, attn_buf, D, &beta,
-        proj_buf, D));
-
-    int n = batch * D;
-    add_residual_kernel<<<(n + 255)/256, 256, 0, stream>>>(x_in, proj_buf, x_out, n);
-    CUDA_CHECK(cudaGetLastError());
-
-    layer_norm(x_out, ln1_buf, weights_.ln2_gamma.ptr, weights_.ln2_beta.ptr,
-               batch, D, eps, stream);
-
-    FFNWeights fw { weights_.W1.ptr, weights_.b1.ptr,
-                    weights_.W2.ptr, weights_.b2.ptr };
-    fused_ffn(ln1_buf, ffn_out, ffn_buf, fw, batch, D, F, cublas_, stream);
-
-    add_residual_kernel<<<(n + 255)/256, 256, 0, stream>>>(x_out, ffn_out, x_out, n);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  Transformer (full model)
-// ════════════════════════════════════════════════════════════════════════════
-
-Transformer::Transformer(const ModelConfig& cfg, const InferenceConfig& icfg)
-    : cfg_(cfg), icfg_(icfg)
+Transformer::Transformer(const ModelConfig& cfg)
+    : cfg_(cfg)
 {
-    CUDA_CHECK(cudaSetDevice(icfg.gpu_id));
-    CUBLAS_CHECK(cublasCreate(&cublas_));
-    CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_TF32_TENSOR_OP_MATH));
+    cublas_.set_stream(nullptr);
+    int max_tokens = cfg.max_seq_len;
+    int max_seqs   = 256;  // reasonable default
+    buffers_.allocate(cfg, max_tokens, max_seqs);
+}
 
-    const int max_batch = icfg.batch_size;
-    const int max_seq   = cfg.max_seq_len;
+Transformer::~Transformer() = default;
 
-    token_emb_.resize((size_t)cfg.vocab_size * cfg.d_model);
-    pos_emb_.resize((size_t)cfg.max_seq_len * cfg.d_model);
-    final_ln_gamma_.resize(cfg.d_model);
-    final_ln_beta_.resize(cfg.d_model);
-    lm_head_.resize((size_t)cfg.vocab_size * cfg.d_model);
-
-    for (int i = 0; i < cfg.n_layers; i++) {
-        layers_.push_back(std::make_unique<TransformerLayer>(cfg, i, cublas_, max_batch));
-        KVCache kvc;
-        kvc.allocate(max_batch, cfg.n_heads, max_seq, cfg.head_dim());
-        kv_caches_.push_back(std::move(kvc));
+void Transformer::load_weights(const std::string& path, cudaStream_t stream) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open weights file: %s\n", path.c_str());
+        return;
     }
 
-    allocate_buffers(max_batch, max_seq);
-    logits_host_.resize((size_t)max_batch * cfg.vocab_size);
-}
+    // Determine file size
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-Transformer::~Transformer() {
-    if (cublas_) cublasDestroy(cublas_);
-}
+    // Read entire file into host memory
+    std::vector<float> host_data(file_size / sizeof(float));
+    size_t read = fread(host_data.data(), sizeof(float), host_data.size(), f);
+    fclose(f);
 
-void Transformer::allocate_buffers(int max_batch, int max_seq) {
-    const size_t T = (size_t)max_batch * max_seq;
-    hidden_.resize(T * cfg_.d_model);
-    hidden_tmp_.resize(T * cfg_.d_model);
-    logits_d_.resize((size_t)max_batch * cfg_.vocab_size);
-}
+    if (read != host_data.size()) {
+        fprintf(stderr, "Warning: read %zu/%zu floats from weights file\n",
+                read, host_data.size());
+    }
 
-void Transformer::load_weights(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open weight file: " + path);
-
-    // Weight file format (flat binary, little-endian float32):
-    //  [token_emb]  vocab_size * d_model
-    //  [pos_emb]    max_seq_len * d_model
-    //  For each layer (in order):
-    //    [ln1_gamma, ln1_beta, Wq, bq, Wk, bk, Wv, bv, Wo, bo,
-    //     ln2_gamma, ln2_beta, W1, b1, W2, b2]
-    //  [final_ln_gamma, final_ln_beta]
-    //  [lm_head]   vocab_size * d_model
-
-    auto load_buf = [&](DeviceBuffer<float>& buf) {
-        std::vector<float> tmp(buf.size);
-        f.read(reinterpret_cast<char*>(tmp.data()), tmp.size() * sizeof(float));
-        CUDA_CHECK(cudaMemcpy(buf.ptr, tmp.data(), buf.bytes(),
-                              cudaMemcpyHostToDevice));
+    // Allocate and copy weights to GPU
+    // Layout: token_emb, pos_emb, [per-layer weights], ln_f_gamma, ln_f_beta, lm_head
+    size_t offset = 0;
+    auto alloc_and_copy = [&](float*& ptr, size_t count) {
+        if (offset + count > host_data.size()) {
+            fprintf(stderr, "Weight file too small at offset %zu\n", offset);
+            return;
+        }
+        CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(ptr, host_data.data() + offset,
+                                   count * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream));
+        offset += count;
     };
 
-    load_buf(token_emb_);
-    load_buf(pos_emb_);
-    for (auto& layer : layers_) {
-        auto& w = layer->weights();
-        load_buf(w.ln1_gamma); load_buf(w.ln1_beta);
-        load_buf(w.Wq);        load_buf(w.bq);
-        load_buf(w.Wk);        load_buf(w.bk);
-        load_buf(w.Wv);        load_buf(w.bv);
-        load_buf(w.Wo);        load_buf(w.bo);
-        load_buf(w.ln2_gamma); load_buf(w.ln2_beta);
-        load_buf(w.W1);        load_buf(w.b1);
-        load_buf(w.W2);        load_buf(w.b2);
+    int d = cfg_.d_model;
+    int kv_dim = cfg_.actual_kv_heads() * cfg_.head_dim();
+
+    alloc_and_copy(weights_.token_emb, (size_t)cfg_.vocab_size * d);
+    alloc_and_copy(weights_.pos_emb,   (size_t)cfg_.max_seq_len * d);
+
+    weights_.layers.resize(cfg_.n_layers);
+    for (int l = 0; l < cfg_.n_layers; ++l) {
+        auto& lw = weights_.layers[l];
+        alloc_and_copy(lw.ln1_gamma, d);
+        alloc_and_copy(lw.ln1_beta,  d);
+        alloc_and_copy(lw.Wq,       (size_t)d * d);
+        alloc_and_copy(lw.Wk,       (size_t)kv_dim * d);
+        alloc_and_copy(lw.Wv,       (size_t)kv_dim * d);
+        alloc_and_copy(lw.Wo,       (size_t)d * d);
+        alloc_and_copy(lw.bq,       d);
+        alloc_and_copy(lw.bk,       kv_dim);
+        alloc_and_copy(lw.bv,       kv_dim);
+        alloc_and_copy(lw.bo,       d);
+        alloc_and_copy(lw.ln2_gamma, d);
+        alloc_and_copy(lw.ln2_beta,  d);
+        alloc_and_copy(lw.W1,       (size_t)cfg_.d_ff * d);
+        alloc_and_copy(lw.b1,       cfg_.d_ff);
+        alloc_and_copy(lw.W2,       (size_t)d * cfg_.d_ff);
+        alloc_and_copy(lw.b2,       d);
     }
-    load_buf(final_ln_gamma_);
-    load_buf(final_ln_beta_);
-    load_buf(lm_head_);
+
+    alloc_and_copy(weights_.ln_f_gamma, d);
+    alloc_and_copy(weights_.ln_f_beta,  d);
+    alloc_and_copy(weights_.lm_head,    (size_t)cfg_.vocab_size * d);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    printf("Loaded %zu parameters (%.1f MB)\n",
+           offset, offset * sizeof(float) / 1048576.0);
 }
 
-void Transformer::prefill(
-    const int* input_ids, float* logits_out, int batch, int seq_len
-) {
-    CUDA_CHECK(cudaSetDevice(icfg_.gpu_id));
-    cudaStream_t stream = stream_.stream;
+void Transformer::compute_qkv(int layer_idx, const float* hidden,
+                               int num_tokens,
+                               float* Q, float* K, float* V,
+                               cudaStream_t stream) {
+    auto& lw = weights_.layers[layer_idx];
+    int d = cfg_.d_model;
+    int kv_dim = cfg_.actual_kv_heads() * cfg_.head_dim();
+
+    cublas_.set_stream(stream);
+
+    // Q = hidden @ Wq^T
+    kernels::linear(hidden, lw.Wq, lw.bq, Q, num_tokens, d, d, cublas_, stream);
+
+    // K = hidden @ Wk^T
+    kernels::linear(hidden, lw.Wk, lw.bk, K, num_tokens, kv_dim, d, cublas_, stream);
+
+    // V = hidden @ Wv^T
+    kernels::linear(hidden, lw.Wv, lw.bv, V, num_tokens, kv_dim, d, cublas_, stream);
+}
+
+void Transformer::layer_forward(
+    int layer_idx, float* hidden, int num_tokens,
+    const int* positions,
+    PagedKVCache& kv_cache,
+    const std::vector<int>& seq_ids,
+    const std::vector<int>& seq_lens,
+    bool is_prefill,
+    const int32_t* query_start_locs,
+    cudaStream_t stream)
+{
+    auto& lw = weights_.layers[layer_idx];
+    int d      = cfg_.d_model;
+    int kv_dim = cfg_.actual_kv_heads() * cfg_.head_dim();
+
+    float* norm_out  = buffers_.norm_out;
+    float* residual  = buffers_.residual;
+    float* qkv_buf   = buffers_.qkv;
+    float* attn_out  = buffers_.attn_out;
+    float* ffn_ws    = buffers_.ffn_workspace;
+
+    // Save residual
+    CUDA_CHECK(cudaMemcpyAsync(residual, hidden,
+                               (size_t)num_tokens * d * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    // Pre-attention LayerNorm
+    kernels::layer_norm(hidden, lw.ln1_gamma, lw.ln1_beta,
+                        norm_out, num_tokens, d, cfg_.layer_norm_eps, stream);
+
+    // QKV projections
+    float* Q = qkv_buf;
+    float* K = Q + (size_t)num_tokens * d;
+    float* V = K + (size_t)num_tokens * kv_dim;
+    compute_qkv(layer_idx, norm_out, num_tokens, Q, K, V, stream);
+
+    // Apply RoPE if no positional embeddings
+    if (!weights_.pos_emb) {
+        kernels::apply_rope(Q, K, positions, num_tokens,
+                            cfg_.n_heads, cfg_.actual_kv_heads(),
+                            cfg_.head_dim(), 10000.f, stream);
+    }
+
+    // Write K, V to paged cache
+    // (In production, this would use write_kv_to_cache with proper mapping)
+    // For now, we prepare block tables and use paged attention
+
+    // Prepare paged attention params
+    auto params = kv_cache.prepare_batch(seq_ids, layer_idx, stream);
+
+    // Run paged attention
+    if (is_prefill) {
+        paged_attention::prefill(Q, attn_out, params, query_start_locs,
+                                 num_tokens, cfg_.n_heads, layer_idx, stream);
+    } else {
+        paged_attention::decode(Q, attn_out, params,
+                                cfg_.n_heads, layer_idx, stream);
+    }
+
+    // Output projection: attn_out = attn_out @ Wo^T
+    kernels::linear(attn_out, lw.Wo, lw.bo, hidden,
+                    num_tokens, d, d, cublas_, stream);
+
+    // Residual connection
+    // hidden = hidden + residual
+    // Then pre-FFN LayerNorm
+    kernels::layer_norm_residual(hidden, residual, lw.ln2_gamma, lw.ln2_beta,
+                                 norm_out, num_tokens, d,
+                                 cfg_.layer_norm_eps, stream);
+
+    // Save new residual (hidden + old_residual)
+    // hidden currently = Wo(attn), add residual
+    // Actually: norm_out = LN(hidden + residual), so save (hidden + residual) as new residual
+    // For GPT-2: residual = hidden + old_residual
+    // Then hidden = norm_out after FFN + residual
+    CUDA_CHECK(cudaMemcpyAsync(residual, hidden,
+                               (size_t)num_tokens * d * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    // FFN
+    kernels::fused_ffn(norm_out, lw.W1, lw.b1, lw.W2, lw.b2,
+                       hidden, ffn_ws,
+                       num_tokens, d, cfg_.d_ff, cublas_, stream);
+
+    // Final residual: hidden = FFN_out + residual
+    // (fused_ffn writes to hidden, add residual in-place)
+    // Simplified: use a kernel or cublasSaxpy
+    float alpha = 1.f;
+    CUBLAS_CHECK(cublasSetStream(cublas_, stream));
+    CUBLAS_CHECK(cublasSaxpy(cublas_, num_tokens * d, &alpha,
+                             residual, 1, hidden, 1));
+}
+
+void Transformer::batch_prefill(
+    const std::vector<int>& packed_tokens,
+    const std::vector<int>& seq_lens,
+    PagedKVCache& kv_cache,
+    const std::vector<int>& seq_ids,
+    float* logits_out,
+    cudaStream_t stream)
+{
+    int num_seqs     = (int)seq_lens.size();
+    int total_tokens = (int)packed_tokens.size();
+    int d = cfg_.d_model;
+
+    cublas_.set_stream(stream);
+
+    // Upload token IDs and compute positions
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.token_ids.ptr, packed_tokens.data(),
+                               total_tokens * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+
+    // Compute positions and query_start_locs on host
+    std::vector<int> positions(total_tokens);
+    std::vector<int32_t> query_starts(num_seqs + 1, 0);
+    int offset = 0;
+    for (int s = 0; s < num_seqs; ++s) {
+        query_starts[s] = offset;
+        for (int t = 0; t < seq_lens[s]; ++t) {
+            positions[offset + t] = t;
+        }
+        offset += seq_lens[s];
+    }
+    query_starts[num_seqs] = total_tokens;
+
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.positions.ptr, positions.data(),
+                               total_tokens * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.query_start_locs.ptr, query_starts.data(),
+                               (num_seqs + 1) * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
 
     // Token + positional embedding
-    DeviceBuffer<int> ids_d(batch * seq_len);
-    CUDA_CHECK(cudaMemcpyAsync(ids_d.ptr, input_ids,
-        batch * seq_len * sizeof(int), cudaMemcpyHostToDevice, stream));
-
-    embed_tokens(ids_d.ptr, hidden_.ptr,
-                 token_emb_.ptr, pos_emb_.ptr,
-                 batch, seq_len, cfg_.d_model, /*offset=*/0, stream);
-
-    // Forward through all layers
-    float* cur = hidden_.ptr;
-    float* nxt = hidden_tmp_.ptr;
-    int layer_i = 0;
-    for (auto& layer : layers_) {
-        layer->forward(cur, nxt, batch, seq_len,
-                       icfg_.use_kv_cache ? &kv_caches_[layer_i] : nullptr,
-                       stream);
-        layer_i++;
-        std::swap(cur, nxt);
+    if (weights_.pos_emb) {
+        kernels::embedding(buffers_.token_ids, buffers_.positions,
+                           weights_.token_emb, weights_.pos_emb,
+                           buffers_.hidden, total_tokens, d, stream);
+    } else {
+        kernels::token_embedding(buffers_.token_ids, weights_.token_emb,
+                                 buffers_.hidden, total_tokens, d, stream);
     }
 
-    // Final layer norm on the last token position only (for LM head)
-    const int last_off = (batch * seq_len - batch) * cfg_.d_model;
-    layer_norm(cur + last_off, logits_d_.ptr,
-               final_ln_gamma_.ptr, final_ln_beta_.ptr,
-               batch, cfg_.d_model, 1e-5f, stream);
-
-    // LM head: [batch, d_model] → [batch, vocab_size]
-    lm_head_project(logits_d_.ptr, logits_d_.ptr,
-                    lm_head_.ptr, batch, cfg_.d_model, cfg_.vocab_size,
-                    cublas_, stream);
-
-    // D2H
-    CUDA_CHECK(cudaMemcpyAsync(logits_out, logits_d_.ptr,
-        (size_t)batch * cfg_.vocab_size * sizeof(float),
-        cudaMemcpyDeviceToHost, stream));
-    stream_.synchronize();
-}
-
-void Transformer::decode(const int* input_ids, float* logits_out, int batch) {
-    CUDA_CHECK(cudaSetDevice(icfg_.gpu_id));
-    cudaStream_t stream = stream_.stream;
-
-    // Embed single token
-    DeviceBuffer<int> ids_d(batch);
-    CUDA_CHECK(cudaMemcpyAsync(ids_d.ptr, input_ids,
-        batch * sizeof(int), cudaMemcpyHostToDevice, stream));
-
-    const int cache_len = kv_caches_[0].current_len;
-    embed_tokens(ids_d.ptr, hidden_.ptr,
-                 token_emb_.ptr, pos_emb_.ptr,
-                 batch, 1, cfg_.d_model, cache_len, stream);
-
-    float* cur = hidden_.ptr;
-    float* nxt = hidden_tmp_.ptr;
-    int layer_i = 0;
-    for (auto& layer : layers_) {
-        layer->decode_step(cur, nxt, batch, kv_caches_[layer_i++], stream);
-        std::swap(cur, nxt);
+    // Run through all layers
+    for (int l = 0; l < cfg_.n_layers; ++l) {
+        layer_forward(l, buffers_.hidden, total_tokens,
+                      buffers_.positions, kv_cache, seq_ids, seq_lens,
+                      /*is_prefill=*/true, buffers_.query_start_locs,
+                      stream);
     }
 
-    layer_norm(cur, logits_d_.ptr,
-               final_ln_gamma_.ptr, final_ln_beta_.ptr,
-               batch, cfg_.d_model, 1e-5f, stream);
-    lm_head_project(logits_d_.ptr, logits_d_.ptr,
-                    lm_head_.ptr, batch, cfg_.d_model, cfg_.vocab_size,
-                    cublas_, stream);
+    // Final layer norm
+    kernels::layer_norm(buffers_.hidden, weights_.ln_f_gamma, weights_.ln_f_beta,
+                        buffers_.norm_out, total_tokens, d,
+                        cfg_.layer_norm_eps, stream);
 
-    CUDA_CHECK(cudaMemcpyAsync(logits_out, logits_d_.ptr,
-        (size_t)batch * cfg_.vocab_size * sizeof(float),
-        cudaMemcpyDeviceToHost, stream));
-    stream_.synchronize();
+    // LM head: extract last token per sequence, project to vocab
+    // For each sequence, take the last token's hidden state
+    float alpha = 1.f, beta = 0.f;
+    for (int s = 0; s < num_seqs; ++s) {
+        int last_pos = query_starts[s + 1] - 1;
+        const float* h = buffers_.norm_out.ptr + (size_t)last_pos * d;
+        float* out = logits_out + (size_t)s * cfg_.vocab_size;
+
+        CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 cfg_.vocab_size, 1, d,
+                                 &alpha, weights_.lm_head, d, h, d,
+                                 &beta, out, cfg_.vocab_size));
+    }
 }
 
-void Transformer::reset_cache() {
-    for (auto& kv : kv_caches_) kv.reset();
-}
+void Transformer::batch_decode(
+    const std::vector<int>& token_ids,
+    const std::vector<int>& seq_lens,
+    PagedKVCache& kv_cache,
+    const std::vector<int>& seq_ids,
+    float* logits_out,
+    cudaStream_t stream)
+{
+    int num_seqs = (int)token_ids.size();
+    int d = cfg_.d_model;
 
-} // namespace flashgen
+    cublas_.set_stream(stream);
+
+    // Upload token IDs
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.token_ids.ptr, token_ids.data(),
+                               num_seqs * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+
+    // Positions: seq_len - 1 for each sequence (0-indexed position of new token)
+    std::vector<int> positions(num_seqs);
+    for (int s = 0; s < num_seqs; ++s) {
+        positions[s] = seq_lens[s] - 1;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.positions.ptr, positions.data(),
+                               num_seqs * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+
+    // Embedding
+    if (weights_.pos_emb) {
+        kernels::embedding(buffers_.token_ids, buffers_.positions,
+                           weights_.token_emb, weights_.pos_emb,
+                           buffers_.hidden, num_seqs, d, stream);
+    } else {
+        kernels::token_embedding(buffers_.token_ids, weights_.token_emb,
+                                 buffers_.hidden, num_seqs, d, stream);
+    }
+
+    // Run through all layers (decode mode: 1 token per seq)
+    std::vector<int32_t> query_starts(num_seqs + 1);
+    std::iota(query_starts.begin(), query_starts.end(), 0);
+    CUDA_CHECK(cudaMemcpyAsync(buffers_.query_start_locs.ptr, query_starts.data(),
+                               (num_seqs + 1) * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    for (int l = 0; l < cfg_.n_layers; ++l) {
+        layer_forward(l, buffers_.hidden, num_seqs,
+                      buffers_.positions, kv_cache, seq_ids, seq_lens,
+                      /*is_prefill=*/false, buffers_.query_start_locs,
+                      stream);
+    }
+
+    // Final LN + LM head
+    kernels::layer_norm(buffers_.hidden, weights_.ln_f_gamma, weights_.ln_f_beta,
+                        buffers_.norm_out, num_seqs, d,
+                        cfg_.layer_norm_eps, stream);
+
+    float alpha = 1.f, beta = 0.f;
+    CUBLAS_CHECK(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                             cfg_.vocab_size, num_seqs, d,
+                             &alpha, weights_.lm_head, d,
+                             buffers_.norm_out, d,
+                             &beta, logits_out, cfg_.vocab_size));
+}

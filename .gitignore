@@ -1,39 +1,39 @@
-# Build directory (CMake output, objects, executables)
+# Build
 build/
+cmake-build-*/
+out/
 
-# Executables
-flashgen
-flashgen.exe
-test_flash_attention
-test_flash_attention.exe
-test_kernels
-test_kernels.exe
-test_pipeline
-test_pipeline.exe
-*.exe
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
 
-# Object and library artifacts
+# Compiled objects
 *.o
 *.obj
 *.a
 *.lib
 *.so
+*.dylib
 *.dll
+*.exe
 
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-*.cmake
-!CMakeLists.txt
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+*.gpu
 
-# IDE / editor
-.idea/
-.vscode/
-*.swp
-*.swo
-.claude/
+# OS
+.DS_Store
+Thumbs.db
 
-# Weight / data (optional: uncomment if you don't want to track .bin)
-# *.bin
+# Model weights
+weights/
+*.bin
+*.safetensors
+*.gguf
