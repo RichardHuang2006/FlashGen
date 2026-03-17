@@ -1,3 +1,6 @@
+# Tests (local only)
+tests/
+
 # Build
 build/
 cmake-build-*/
