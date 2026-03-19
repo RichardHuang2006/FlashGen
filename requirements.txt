@@ -1,0 +1,36 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0  # optional but often needed alongside torch
+
+# HuggingFace ecosystem
+transformers>=4.35.0
+safetensors>=0.4.0
+huggingface-hub>=0.19.0
+tokenizers>=0.15.0
+
+# ONNX
+onnx>=1.15.0
+onnxruntime-gpu>=1.16.0  # CPU fallback: onnxruntime>=1.16.0
+
+# Numerics
+numpy>=1.24.0
+
+# Utilities
+tqdm>=4.65.0
+pydantic>=2.0.0       # optional: for config validation
+
+# TensorRT (installed separately via NVIDIA pip index or deb packages)
+# tensorrt>=8.6.0     # pip install tensorrt --index-url https://pypi.ngc.nvidia.com
+
+# Profiling (optional)
+# nvtx>=0.2.5         # NVTX markers for Nsight Systems
+# matplotlib>=3.7.0   # for benchmark plots
+
+# Build
+pybind11>=2.11.0
+cmake>=3.22.0
+ninja>=1.11.0          # faster builds
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

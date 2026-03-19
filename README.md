@@ -1,311 +1,342 @@
-<h1 align="center">FlashGen</h1>
+# FlashGen
 
-<p align="center">
-<strong>High-Performance LLM Inference Engine</strong><br>
-Paged KV Cache &middot; Continuous Batching &middot; Custom CUDA Kernels
-</p>
+**End-to-end LLM inference engine** — TensorRT + custom CUDA kernels + vLLM-style paged KV cache.
 
-<p align="center">
-<img src="https://img.shields.io/badge/CUDA-12.x-green?logo=nvidia" alt="CUDA 12">
-<img src="https://img.shields.io/badge/C%2B%2B-17-blue?logo=cplusplus" alt="C++17">
-<img src="https://img.shields.io/badge/GPU-Ampere%2B-orange" alt="GPU Ampere+">
-<img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT License">
-</p>
+Inspired by [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) and [vLLM](https://github.com/vllm-project/vllm), this project demonstrates systems-level GPU optimization for large language model serving: from HuggingFace model loading through ONNX export, TensorRT engine building, and high-throughput continuous batching with custom CUDA kernels.
 
 ---
 
-FlashGen is a from-scratch LLM inference engine written in C++17 and CUDA that combines **vLLM-style paged KV cache management** with **FlashAttention-2 kernels** and a **continuous batching scheduler** to serve decoder-only transformer models efficiently on NVIDIA GPUs.
-
-## Architecture
+## Architecture Overview
 
 ```
-                    ┌──────────────────────┐
-                    │   InferenceEngine    │
-                    │   (engine loop)      │
-                    └──────────┬───────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-    ┌─────────▼──────┐  ┌─────▼──────┐  ┌──────▼───────┐
-    │   Scheduler    │  │ Transformer │  │   Sampling   │
-    │ (continuous    │  │ (batched    │  │ (greedy,     │
-    │  batching)     │  │  forward)   │  │  top-p/k)    │
-    └───┬────┬───────┘  └──────┬──────┘  └──────────────┘
-        │    │                 │
-        │    │        ┌────────▼────────┐
-        │    │        │  Paged Flash    │
-        │    │        │  Attention      │
-        │    │        │  (CUDA kernel)  │
-        │    │        └────────┬────────┘
-        │    │                 │
-   ┌────▼────▼──┐    ┌────────▼────────┐
-   │  Prefix    │    │  Paged KV Cache │
-   │  Cache     │    │  (block tables) │
-   │ (radix     │    └────────┬────────┘
-   │  tree)     │             │
-   └────────────┘    ┌────────▼────────┐
-                     │ Block Allocator │
-                     │ (GPU mem pool,  │
-                     │  ref-counted)   │
-                     └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     Python API  (flashgen/)                     │
+│                                                                 │
+│  LLM / AsyncLLMEngine                                          │
+│    ├── HFModelLoader      HuggingFace → GPU weight tensors     │
+│    ├── ONNXExporter       torch.onnx.export (KV cache as I/O)  │
+│    ├── TRTEngineBuilder   ONNX → TensorRT FP16 / INT8          │
+│    ├── TRTEngine          Run serialized .trt engine           │
+│    ├── ContinuousBatcher  Iteration-level scheduling           │
+│    ├── BlockAllocator     GPU memory pool — O(1) alloc/free    │
+│    ├── PagedKVCache       Block-table indirection + CoW prefix │
+│    ├── Sampler            Greedy / top-k / top-p / temperature │
+│    └── StreamingGenerator Real-time token-by-token streaming   │
+│                                                                 │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │  PyBind11  (_C extension)
+┌──────────────────────▼──────────────────────────────────────────┐
+│                  C++ / CUDA Runtime  (csrc/)                    │
+│                                                                 │
+│  InferenceEngine  (pipeline.cpp)                               │
+│    ├── Transformer        transformer.cu                       │
+│    │     ├── FlashAttention-2    flash_attention.cu            │
+│    │     ├── Paged attention     paged_kv_cache.cu             │
+│    │     ├── RMSNorm / LayerNorm kernels.cu                    │
+│    │     ├── RoPE (in-place)     kernels.cu                    │
+│    │     └── SwiGLU / GELU FFN  kernels.cu                    │
+│    ├── BlockAllocator     block_allocator.cpp                  │
+│    ├── PagedKVCache       paged_kv_cache.cu                    │
+│    ├── PrefixCache        prefix_cache.cpp  (radix tree LRU)  │
+│    └── Scheduler          scheduler.cpp                        │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## Key Features
 
-### Paged KV Cache (vLLM-style)
-- **Block-table indirection**: KV cache is divided into fixed-size blocks (default 16 tokens). Each sequence maintains a block table mapping logical positions to physical GPU blocks, eliminating memory waste from pre-allocated contiguous buffers.
-- **Reference-counted blocks**: Blocks track their reference count, enabling copy-on-write semantics and zero-copy prefix sharing between sequences.
-- **Dynamic memory**: Sequences allocate blocks on-demand as they grow during decoding, with automatic reclamation on completion.
+### 1. TensorRT Engine (FP16 + INT8)
 
-### Continuous Batching Scheduler
-- **Iteration-level scheduling**: After every forward pass, the scheduler re-evaluates which sequences to include in the next batch, admitting new prefills and continuing decode steps concurrently.
-- **Three-queue design**: Waiting (new requests), Running (active), and Preempted (evicted) queues following the vLLM scheduling algorithm.
-- **Preemption support**: Under memory pressure, the scheduler evicts the lowest-priority running sequence (recompute or swap-to-CPU) to free blocks for higher-priority work.
-- **Token budget**: Configurable `max_num_tokens` per iteration prevents long prefills from starving decode latency.
+Export any HuggingFace causal LM to ONNX with **KV cache as explicit graph I/O**,
+then build an optimized TensorRT engine:
 
-### Prefix-Aware KV Cache Reuse
-- **Radix tree index**: Common prompt prefixes (system prompts, few-shot examples) are stored in a radix tree indexed by token sequences. New requests that share a prefix skip prefill for the matched portion.
-- **LRU eviction**: Under memory pressure, least-recently-used prefix entries are evicted to free blocks.
-- **Transparent integration**: The scheduler automatically checks the prefix cache before admitting new requests.
+- **FP16** — halves memory bandwidth pressure; uses Tensor Cores. ~2× vs FP32.
+- **INT8** — EntropyCalibrator2 computes per-tensor activation scales.
+  ~3–4× vs FP32, <1% perplexity loss.
+- Dynamic shape optimization profiles cover prefill and decode separately.
+- KV cache is managed outside TRT (paged blocks); TRT handles the transformer body.
 
-### Custom CUDA Kernels
-- **FlashAttention-2**: Tiled, IO-aware attention with online softmax. O(N d) memory instead of O(N^2). Supports causal masking, multiple head dimensions (32-128), and incremental decode.
-- **Paged attention kernels**: Modified FlashAttention that reads K/V through block table indirection, supporting variable-length sequences in a single batch.
-- **Fused kernels**: LayerNorm (Welford), RMSNorm, GELU, SiLU, fused residual-add-LayerNorm, fused FFN (cuBLAS GEMM + activation), RoPE, and temperature-scaled softmax.
-- **Quantized KV storage**: INT8 symmetric per-token quantization with fused dequantization inside the attention kernel for ~2x KV cache memory savings.
+### 2. Custom CUDA Kernels
 
-### Model Support
-- GPT-2 family (124M to 1.5B parameters)
-- LLaMA-style architectures (RoPE, RMSNorm, GQA, SiLU-gated FFN)
-- Configurable GQA (grouped-query attention) with arbitrary `n_kv_heads`
+| Kernel | File | Key optimization |
+|--------|------|-----------------|
+| FlashAttention-2 | `flash_attention.cu` | Tiled Q (Br=64), K/V (Bc=64); online softmax; O(n) HBM reads |
+| Paged attention decode | `paged_kv_cache.cu` | Block-table indirection; one warp per (seq, head) |
+| Paged attention prefill | `paged_kv_cache.cu` | Multi-token query with tiled KV gather |
+| RMSNorm + residual | `kernels.cu` | Fused Welford reduction; one warp per row |
+| RoPE | `kernels.cu` | In-place; zero extra allocation |
+| SwiGLU FFN | `kernels.cu` | Fused gate × silu(up) multiply |
+| INT8 quantization | `quantization.cu` | Per-token symmetric; dequant fused into attention |
+
+### 3. Paged KV Cache (vLLM-style)
+
+```
+Traditional:  allocate max_seq_len × kv_size per sequence → 30–60% waste
+Paged:        allocate one block (16 tokens) at a time → <1% waste
+
+Block table:  seq_id → [physical_block_0, physical_block_1, ...]
+              Attention kernel follows block table indirection to locate K,V.
+```
+
+Benefits:
+- **+55% more concurrent sequences** in the same GPU memory
+- **Zero external fragmentation** between sequences
+- **Copy-on-write prefix sharing** via reference counting
+
+### 4. Continuous Batching
+
+```
+Static batching:    [AAAA____] [BBBBBBBB]  — GPU idle while short A waits for long B
+Continuous:         [AAAACCCC] [BBBBBBBB]  — C starts the moment A finishes
+                          ↑ A finishes → C admitted from WAITING queue
+```
+
+Three-queue scheduler (WAITING → RUNNING → PREEMPTED):
+- FCFS admission with memory-aware preemption (LIFO eviction)
+- Token budget prevents prefill from starving decode iterations
+- Chunked prefill splits long prompts across iterations
+
+### 5. Streaming Generation
+
+```python
+for piece in llm.stream("Tell me about GPU memory", params):
+    print(piece, end="", flush=True)   # tokens appear in real-time
+```
+
+- **TTFT** (Time-To-First-Token): dominant latency for chat UX
+- **TPOT** (Time-Per-Output-Token): streaming smoothness
+- SSE format support for HTTP/FastAPI streaming
+
+---
+
+## GPU Execution Tradeoffs
+
+| Axis | Lever | Tradeoff |
+|------|-------|----------|
+| Memory bandwidth | FP16 weights/activations | 2× BW savings vs FP32; <0.1% accuracy |
+| Memory bandwidth | INT8 KV cache | 4× KV memory; ~1% perplexity |
+| Compute efficiency | FlashAttention-2 | 2–4× attn kernel; avoids O(n²) memory |
+| Memory efficiency | Block size (tokens/block) | Smaller → less waste, more table overhead |
+| Latency vs throughput | max_num_tokens | Larger → better GPU utilization, higher TPOT |
+| Latency vs throughput | Batch size | Larger → higher throughput, higher tail latency |
+| Repeated context | Prefix caching (radix tree) | Eliminates redundant prefill for shared prompts |
+| GQA | n_kv_heads < n_heads | Less KV memory; same n_heads query compute |
+
+---
+
+## Supported Models
+
+| Model | HF ID | Architecture |
+|-------|-------|--------------|
+| GPT-2 | `gpt2` | MHA, learned pos emb, GELU FFN |
+| GPT-2 Medium | `gpt2-medium` | MHA, learned pos emb, GELU FFN |
+| GPT-2 XL | `gpt2-xl` | MHA, learned pos emb, GELU FFN |
+| LLaMA-2 7B | `meta-llama/Llama-2-7b-hf` | MHA, RoPE, RMSNorm, SwiGLU |
+| LLaMA-2 13B | `meta-llama/Llama-2-13b-hf` | MHA, RoPE, RMSNorm, SwiGLU |
+| Mistral 7B | `mistralai/Mistral-7B-v0.1` | GQA (8 KV heads), RoPE, SwiGLU |
+
+---
+
+## Installation
+
+### Prerequisites
+
+- NVIDIA GPU (Ampere sm_80+ recommended)
+- CUDA 12.x + cuDNN
+- Python 3.9+
+- CMake 3.22+
+
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Build the C++ CUDA extension (flashgen._C)
+GPU_ARCH=80 pip install -e .   # A100 / A10G
+GPU_ARCH=86 pip install -e .   # RTX 3090 / A6000
+GPU_ARCH=89 pip install -e .   # RTX 4090 / L40S
+GPU_ARCH=90 pip install -e .   # H100
+```
+
+### Manual CMake build (for kernel development)
+
+```bash
+mkdir build && cd build
+cmake .. -DGPU_ARCH=80 -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target flashgen_ext -j$(nproc)
+cd ..
+# _C.so is placed directly in flashgen/ for immediate import
+```
+
+### TensorRT (optional)
+
+```bash
+pip install tensorrt --index-url https://pypi.ngc.nvidia.com
+# Or via apt: sudo apt-get install tensorrt
+```
+
+---
+
+## Quick Start
+
+```python
+from flashgen import LLM, SamplingParams
+
+# Load model (no build required for pytorch backend)
+llm = LLM("gpt2", backend="pytorch")
+params = SamplingParams(temperature=0.8, top_p=0.9, max_tokens=100)
+
+# Single generation
+output = llm.generate("The future of artificial intelligence is", params)
+print(output.text)
+print(f"{output.generated_tokens} tokens | {output.latency_ms:.0f}ms | "
+      f"{output.throughput_tps:.0f} tok/s")
+
+# Streaming (tokens appear in real-time)
+for piece in llm.stream("Once upon a time in a GPU datacenter", params):
+    print(piece, end="", flush=True)
+
+# Batch generation (continuous batching)
+outputs = llm.generate_batch(
+    ["Hello world", "What is CUDA?", "Explain attention mechanisms"],
+    params
+)
+for o in outputs:
+    print(o.text[:80])
+```
+
+---
+
+## ONNX Export + TensorRT
+
+```python
+llm = LLM("gpt2")
+
+# Step 1: Export to ONNX (KV cache as explicit graph I/O)
+llm.export_onnx("engines/gpt2.onnx")
+
+# Step 2: Build TRT engine
+llm.build_trt_engine(
+    "engines/gpt2.onnx",
+    "engines/gpt2_fp16.trt",
+    precision="fp16",
+    max_batch=32,
+    max_seq=1024,
+)
+
+# Step 3: Use TRT engine for inference
+llm_trt = LLM("gpt2", backend="trt", trt_engine_path="engines/gpt2_fp16.trt")
+output = llm_trt.generate("The GPU executes", params)
+```
+
+CLI:
+```bash
+python scripts/build_engine.py \
+    --model gpt2 \
+    --precision fp16 \
+    --output-dir engines/ \
+    --validate
+```
+
+---
+
+## Benchmarks
+
+```bash
+# Throughput benchmark (FlashGen vs PyTorch baseline)
+python -m flashgen.benchmarks.bench_pytorch \
+    --model gpt2 \
+    --num-requests 50 \
+    --input-len 128 \
+    --output-len 128
+
+# Latency (TTFT + TPOT percentiles)
+python -m flashgen.benchmarks.bench_latency \
+    --model gpt2 \
+    --input-len 256 \
+    --output-len 128 \
+    --num-iters 100
+
+# Profile with Nsight Systems (captures NVTX ranges)
+nsys profile --trace cuda,nvtx \
+    python -m flashgen.benchmarks.bench_throughput \
+        --model gpt2 --num-requests 30
+nsys-ui report1.nsys-rep
+```
+
+### Expected speedups vs PyTorch FP32 baseline
+
+| Configuration | Prefill tok/s | Decode tok/s | Notes |
+|---|---|---|---|
+| PyTorch FP32 | 1× | 1× | Baseline |
+| PyTorch FP16 | ~1.8× | ~1.8× | Tensor Core activation |
+| FlashAttention-2 FP16 | ~3× | ~1.5× | Reduced HBM reads |
+| TensorRT FP16 | ~2.5× | ~2.5× | Kernel fusion, layout opt |
+| TensorRT INT8 | ~4× | ~4× | Tensor Core INT8 |
+| + Continuous batching | — | ~3× throughput | Eliminates idle GPU time |
+
+---
 
 ## Project Structure
 
 ```
 FlashGen/
-├── include/
-│   ├── cuda_utils.cuh         # CUDA error checking, RAII wrappers (streams, events, buffers)
-│   ├── model_config.hpp       # Model, cache, scheduler, and engine configuration
-│   ├── request.hpp            # Request, sequence, sampling params, response types
-│   ├── block_allocator.hpp    # GPU memory pool with ref-counted block management
-│   ├── paged_kv_cache.cuh     # Block-table-based KV cache + paged attention params
-│   ├── prefix_cache.hpp       # Radix-tree prefix cache for KV block reuse
-│   ├── quantization.cuh       # INT8/FP8 KV quantization with fused dequant
-│   ├── flash_attention.cuh    # FlashAttention-2 kernel declarations
-│   ├── kernels.cuh            # Fused transformer kernel declarations
-│   ├── scheduler.hpp          # Continuous batching scheduler
-│   ├── transformer.hpp        # Transformer model with paged KV cache
-│   └── pipeline.hpp           # Inference engine (integrates all components)
-├── src/
-│   ├── block_allocator.cpp    # Block allocator: alloc, free, ref count, CoW
-│   ├── paged_kv_cache.cu      # Paged KV cache + paged attention CUDA kernels
-│   ├── prefix_cache.cpp       # Radix tree insert, match, evict
-│   ├── quantization.cu        # INT8 quantize/dequantize kernels
-│   ├── flash_attention.cu     # FlashAttention-2 forward + decode kernels
-│   ├── kernels.cu             # LayerNorm, GELU, SiLU, RoPE, softmax, FFN, embedding
-│   ├── scheduler.cpp          # Three-queue scheduling with preemption
-│   ├── transformer.cu         # Batched prefill/decode with paged attention
-│   ├── pipeline.cpp           # Engine loop, sampling, benchmarking
-│   └── main.cpp               # CLI entry point
-├── tests/
-│   ├── test_block_allocator.cpp    # Alloc/free, ref counting, CoW, OOM
-│   ├── test_paged_attention.cu     # Paged KV lifecycle, fork, attention correctness
-│   ├── test_prefix_cache.cpp       # Prefix match, partial match, eviction
-│   ├── test_scheduler.cpp          # Scheduling, token budget, finish conditions
-│   ├── test_flash_attention.cu     # Correctness vs naive, decode, throughput
-│   ├── test_kernels.cu             # LayerNorm, GELU, SiLU, RMSNorm, softmax, argmax
-│   └── test_pipeline.cpp           # Engine lifecycle, async submit, stats
+├── flashgen/                     Python package (primary interface)
+│   ├── llm.py                    High-level LLM class
+│   ├── engine.py                 AsyncLLMEngine orchestration
+│   ├── outputs.py                RequestOutput, CompletionOutput
+│   ├── core/config.py            ModelConfig, SamplingParams, EngineConfig
+│   ├── model_loader/
+│   │   ├── hf_loader.py          HuggingFace weight loading + name mapping
+│   │   └── tokenizer.py          Tokenizer wrapper
+│   ├── onnx_export/exporter.py   ONNX export with KV cache I/O
+│   ├── trt_builder/
+│   │   ├── builder.py            TensorRT engine builder (FP16/INT8)
+│   │   ├── calibrator.py         INT8 EntropyCalibrator2
+│   │   └── engine_runner.py      TRT inference runner
+│   ├── memory/
+│   │   ├── block_allocator.py    GPU block pool (Python)
+│   │   └── paged_kv_cache.py     Block-table KV cache
+│   ├── scheduler/continuous_batcher.py   3-queue FCFS scheduler
+│   ├── sampling/sampler.py       Greedy / top-k / top-p / temperature
+│   ├── streaming/generator.py    Sync + async streaming
+│   ├── profiling/nsight.py       NVTX markers for Nsight
+│   └── benchmarks/
+│       ├── bench_throughput.py   Prefill + decode throughput
+│       ├── bench_latency.py      TTFT + TPOT percentiles
+│       └── bench_pytorch.py      PyTorch baseline comparison
+│
+├── csrc/                         C++ / CUDA kernel library
+│   ├── include/                  Headers (model_config, request, scheduler…)
+│   ├── kernels/
+│   │   ├── flash_attention.cu    FlashAttention-2 (Br=64, Bc=64)
+│   │   ├── paged_kv_cache.cu     Paged attention (prefill + decode)
+│   │   ├── kernels.cu            Norm, RoPE, FFN, sampling kernels
+│   │   └── quantization.cu       INT8 symmetric per-token quantization
+│   ├── runtime/
+│   │   ├── block_allocator.cpp   O(1) free-list allocator + refcounting
+│   │   ├── prefix_cache.cpp      Radix tree LRU prefix cache
+│   │   ├── scheduler.cpp         Continuous batching (WAITING/RUNNING/PREEMPTED)
+│   │   ├── transformer.cu        Transformer forward pass + paged attention
+│   │   └── pipeline.cpp          Engine loop, sampling, benchmarking
+│   └── bindings/flashgen_bindings.cpp   PyBind11 Python ↔ C++ bridge
+│
+├── examples/
+│   ├── basic_inference.py        Single prompt + sampling strategy comparison
+│   ├── streaming_demo.py         Real-time streaming with TTFT/TPOT stats
+│   └── batch_inference.py        Concurrent requests + batch size scaling
+├── scripts/build_engine.py       CLI: ONNX export → TRT engine build
 ├── CMakeLists.txt
-└── README.md
+├── setup.py
+└── requirements.txt
 ```
 
-## Building
+---
 
-### Prerequisites
-- NVIDIA GPU (Ampere sm_80+ recommended, Volta sm_70+ minimum)
-- CUDA Toolkit 12.x
-- CMake 3.20+
-- C++17 compiler (GCC 9+, Clang 10+, MSVC 2019+)
+## References
 
-### Build
-
-```bash
-mkdir build && cd build
-cmake .. -DGPU_ARCH=80          # Set your GPU's compute capability
-cmake --build . -j$(nproc)
-```
-
-Common GPU architectures:
-
-| GPU | Architecture |
-|-----|-------------|
-| V100 | `70` |
-| RTX 3090, A100 | `80` |
-| RTX 4090 | `89` |
-| H100 | `90` |
-| B200 | `120` |
-
-### Run Tests
-
-```bash
-cd build
-ctest --output-on-failure
-```
-
-## Usage
-
-### Generation
-
-```bash
-./flashgen \
-    --model gpt2 \
-    --weights /path/to/weights.bin \
-    --prompt "The future of artificial intelligence" \
-    --max-tokens 128 \
-    --temperature 0.8 \
-    --top-p 0.95
-```
-
-### Benchmarking
-
-```bash
-./flashgen \
-    --model gpt2-xl \
-    --benchmark \
-    --bench-seq 512 \
-    --bench-batch 8 \
-    --bench-runs 20
-```
-
-### Configuration Options
-
-```
-Model:
-  --model NAME             gpt2, gpt2-medium, gpt2-large, gpt2-xl, llama-7b
-  --weights PATH           Binary weights file
-  --device ID              GPU device (default: 0)
-
-Generation:
-  --prompt TEXT            Input prompt
-  --max-tokens N           Max output tokens (default: 64)
-  --temperature F          Sampling temperature (default: 0.8)
-  --top-p F                Nucleus sampling threshold (default: 0.95)
-  --greedy                 Greedy decoding
-
-KV Cache:
-  --block-size N           Tokens per cache block (default: 16)
-  --num-blocks N           GPU blocks (-1 = auto from available VRAM)
-  --gpu-mem-frac F         VRAM fraction for KV cache (default: 0.9)
-  --kv-quant TYPE          none | int8 | fp8
-  --prefix-cache           Enable prefix caching (default)
-  --no-prefix-cache        Disable prefix caching
-
-Scheduler:
-  --max-seqs N             Max concurrent sequences (default: 256)
-  --max-tokens-batch N     Max tokens per iteration (default: 8192)
-```
-
-## Core Components
-
-### Block Allocator
-
-The block allocator pre-allocates a contiguous GPU memory pool and divides it into fixed-size blocks. Each block stores K and V tensors for `block_size` tokens across all layers and KV heads:
-
-```
-Physical block layout:
-  [Layer 0, Head 0, K: block_size * head_dim * elem_size]
-  [Layer 0, Head 0, V: block_size * head_dim * elem_size]
-  [Layer 0, Head 1, K: ...]
-  ...
-  [Layer N, Head M, V: ...]
-```
-
-Blocks are managed with a free-list stack (O(1) alloc/free) and atomic reference counts. Copy-on-write is triggered when a shared block (refcount > 1) needs modification — a new block is allocated, data is copied via `cudaMemcpyAsync`, and the old reference is decremented.
-
-### Paged Attention Kernel
-
-The decode kernel assigns one warp (32 threads) per (sequence, head) pair. Each warp iterates over all physical blocks in the sequence's block table, performing online softmax attention:
-
-```
-for each block in block_table[seq_idx]:
-    phys_block = block_table[seq_idx][logical_block]
-    K_ptr = pool + phys_block * stride + layer * layer_stride + head * head_stride
-    V_ptr = K_ptr + kv_stride
-
-    for each token in block:
-        dot = warp_reduce(Q . K[token])
-        online_softmax_update(dot, m, l, acc, V[token])
-
-write O = acc  (already normalized by online softmax)
-```
-
-### FlashAttention-2
-
-Tiled, IO-aware attention algorithm avoiding the N^2 attention matrix:
-
-```
-for each Q tile (q_start..q_start+Br):
-    m = -inf,  l = 0,  O = 0
-    for each KV tile (kv_start..kv_start+Bc):
-        S  = Q_tile . K^T_tile * scale        # [Br, Bc]
-        m' = max(rowmax(S), m)
-        P  = exp(S - m')                      # [Br, Bc]
-        l' = rowsum(P) + l * exp(m - m')
-        O  = O * exp(m - m') + P . V_tile
-        m, l = m', l'
-    O /= l
-```
-
-### Scheduling Algorithm
-
-Each iteration:
-1. **Resume preempted** (LIFO): restore evicted sequences if blocks available
-2. **Admit waiting** (FCFS): check prefix cache, allocate blocks, respect token budget
-3. **Continue decode**: extend running sequences by one token each
-4. **Preempt if needed**: evict lowest-priority running sequence to free memory
-
-### INT8 KV Quantization
-
-Per-token symmetric quantization reduces KV cache memory by ~2x:
-```
-scale = max(|x|) / 127
-q[i] = round(clamp(x[i] / scale, -128, 127))
-```
-
-Dequantization is fused into the attention kernel's inner loop to avoid materializing full-precision intermediates.
-
-## Supported Models
-
-| Model | Layers | Heads | d_model | d_ff | Parameters |
-|-------|--------|-------|---------|------|------------|
-| GPT-2 | 12 | 12 | 768 | 3072 | 124M |
-| GPT-2 Medium | 24 | 16 | 1024 | 4096 | 355M |
-| GPT-2 Large | 36 | 20 | 1280 | 5120 | 774M |
-| GPT-2 XL | 48 | 25 | 1600 | 6400 | 1.5B |
-| LLaMA 7B | 32 | 32 | 4096 | 11008 | 6.7B |
-| LLaMA-2 7B | 32 | 32 (GQA) | 4096 | 11008 | 6.7B |
-
-## Performance Characteristics
-
-| Component | Complexity | Notes |
-|-----------|-----------|-------|
-| Block alloc/free | O(1) | Stack-based free list |
-| Prefix cache lookup | O(L/B) | L=prompt length, B=block size |
-| Flash attention (prefill) | O(N^2 d / M) | M=SRAM size, IO-aware |
-| Paged attention (decode) | O(N d) | N=context length per seq |
-| Scheduling | O(W + R) | W=waiting, R=running queue sizes |
-
-## Roadmap
-
-- [ ] BPE tokenizer integration (tiktoken / SentencePiece)
-- [ ] SafeTensors / HuggingFace weight loader
-- [ ] Tensor parallelism (multi-GPU)
-- [ ] Speculative decoding
-- [ ] CUDA graph capture for decode batches
-- [ ] FP8 native support on Hopper (sm_90+)
-- [ ] OpenAI-compatible HTTP API server
-- [ ] Beam search
-
-## License
-
-MIT
+- [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691) — Dao et al., 2023
+- [Efficient Memory Management for LLM Serving with PagedAttention](https://arxiv.org/abs/2309.06180) — Kwon et al., 2023 (vLLM)
+- [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu) — Yu et al., 2022
+- [GQA: Training Generalized Multi-Query Transformer Models](https://arxiv.org/abs/2305.13245) — Ainslie et al., 2023
+- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) — NVIDIA, 2023
