@@ -22,15 +22,7 @@ pydantic>=2.0.0       # optional: for config validation
 # TensorRT (installed separately via NVIDIA pip index or deb packages)
 # tensorrt>=8.6.0     # pip install tensorrt --index-url https://pypi.ngc.nvidia.com
 
-# Profiling (optional)
-# nvtx>=0.2.5         # NVTX markers for Nsight Systems
-# matplotlib>=3.7.0   # for benchmark plots
-
 # Build
 pybind11>=2.11.0
 cmake>=3.22.0
 ninja>=1.11.0          # faster builds
-
-# Testing
-pytest>=7.0.0
-pytest-asyncio>=0.21.0

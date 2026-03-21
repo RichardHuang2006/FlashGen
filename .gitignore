@@ -1,13 +1,3 @@
-# ── Old directory structure (superseded by csrc/) ────────────────────────────
-include/
-src/
-
-# ── Temporary files ───────────────────────────────────────────────────────────
-test_quick.py
-tests/test_*.cpp
-tests/test_*.cu
-tests/test_pipeline.cpp
-
 # ── Build artifacts ───────────────────────────────────────────────────────────
 build/
 cmake-build-*/

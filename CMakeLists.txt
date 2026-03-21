@@ -123,32 +123,6 @@ else()
   message(WARNING "pybind11 not found — Python bindings disabled")
 endif()
 
-# ── Unit tests ───────────────────────────────────────────────────────────────
-enable_testing()
-
-set(CPP_TESTS test_block_allocator test_prefix_cache test_scheduler)
-foreach(t ${CPP_TESTS})
-  if(EXISTS "${CMAKE_SOURCE_DIR}/tests/unit/${t}.cpp")
-    add_executable(${t} tests/unit/${t}.cpp)
-    target_link_libraries(${t} PRIVATE flashgen_kernels)
-    target_include_directories(${t} PRIVATE csrc/include)
-    add_test(NAME ${t} COMMAND ${t})
-  endif()
-endforeach()
-
-set(CUDA_TESTS test_flash_attention test_paged_attention test_kernels)
-foreach(t ${CUDA_TESTS})
-  if(EXISTS "${CMAKE_SOURCE_DIR}/tests/unit/${t}.cu")
-    add_executable(${t} tests/unit/${t}.cu)
-    target_link_libraries(${t} PRIVATE flashgen_kernels)
-    target_include_directories(${t} PRIVATE csrc/include)
-    target_compile_options(${t} PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_CUDA_FLAGS}>
-    )
-    add_test(NAME ${t} COMMAND ${t})
-  endif()
-endforeach()
-
 # ── Summary ───────────────────────────────────────────────────────────────────
 message(STATUS "")
 message(STATUS "FlashGen build configuration:")

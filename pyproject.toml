@@ -22,13 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 trt = ["tensorrt>=8.6"]
-bench = ["nvtx>=0.2", "matplotlib>=3.7"]
-dev   = ["pytest>=7.0", "pytest-asyncio>=0.21"]
-
-[project.scripts]
-flashgen-build-engine = "scripts.build_engine:main"
-flashgen-download     = "scripts.download_model:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["flashgen*", "scripts*"]
+include = ["flashgen*"]

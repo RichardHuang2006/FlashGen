@@ -229,52 +229,6 @@ llm_trt = LLM("gpt2", backend="trt", trt_engine_path="engines/gpt2_fp16.trt")
 output = llm_trt.generate("The GPU executes", params)
 ```
 
-CLI:
-```bash
-python scripts/build_engine.py \
-    --model gpt2 \
-    --precision fp16 \
-    --output-dir engines/ \
-    --validate
-```
-
----
-
-## Benchmarks
-
-```bash
-# Throughput benchmark (FlashGen vs PyTorch baseline)
-python -m flashgen.benchmarks.bench_pytorch \
-    --model gpt2 \
-    --num-requests 50 \
-    --input-len 128 \
-    --output-len 128
-
-# Latency (TTFT + TPOT percentiles)
-python -m flashgen.benchmarks.bench_latency \
-    --model gpt2 \
-    --input-len 256 \
-    --output-len 128 \
-    --num-iters 100
-
-# Profile with Nsight Systems (captures NVTX ranges)
-nsys profile --trace cuda,nvtx \
-    python -m flashgen.benchmarks.bench_throughput \
-        --model gpt2 --num-requests 30
-nsys-ui report1.nsys-rep
-```
-
-### Expected speedups vs PyTorch FP32 baseline
-
-| Configuration | Prefill tok/s | Decode tok/s | Notes |
-|---|---|---|---|
-| PyTorch FP32 | 1× | 1× | Baseline |
-| PyTorch FP16 | ~1.8× | ~1.8× | Tensor Core activation |
-| FlashAttention-2 FP16 | ~3× | ~1.5× | Reduced HBM reads |
-| TensorRT FP16 | ~2.5× | ~2.5× | Kernel fusion, layout opt |
-| TensorRT INT8 | ~4× | ~4× | Tensor Core INT8 |
-| + Continuous batching | — | ~3× throughput | Eliminates idle GPU time |
-
 ---
 
 ## Project Structure
@@ -300,11 +254,7 @@ FlashGen/
 │   ├── scheduler/continuous_batcher.py   3-queue FCFS scheduler
 │   ├── sampling/sampler.py       Greedy / top-k / top-p / temperature
 │   ├── streaming/generator.py    Sync + async streaming
-│   ├── profiling/nsight.py       NVTX markers for Nsight
-│   └── benchmarks/
-│       ├── bench_throughput.py   Prefill + decode throughput
-│       ├── bench_latency.py      TTFT + TPOT percentiles
-│       └── bench_pytorch.py      PyTorch baseline comparison
+│   └── profiling/nsight.py       Engine profiling hooks (no-op stubs)
 │
 ├── csrc/                         C++ / CUDA kernel library
 │   ├── include/                  Headers (model_config, request, scheduler…)
@@ -321,11 +271,6 @@ FlashGen/
 │   │   └── pipeline.cpp          Engine loop, sampling, benchmarking
 │   └── bindings/flashgen_bindings.cpp   PyBind11 Python ↔ C++ bridge
 │
-├── examples/
-│   ├── basic_inference.py        Single prompt + sampling strategy comparison
-│   ├── streaming_demo.py         Real-time streaming with TTFT/TPOT stats
-│   └── batch_inference.py        Concurrent requests + batch size scaling
-├── scripts/build_engine.py       CLI: ONNX export → TRT engine build
 ├── CMakeLists.txt
 ├── setup.py
 └── requirements.txt
